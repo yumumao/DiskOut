@@ -24,6 +24,14 @@ SERVICES = [
     ("StorSvc",       "Storage Service"),
 ]
 
+DRIVE_TYPE_MAP = {
+    2: "可移动",
+    3: "固定",
+    4: "网络",
+    5: "光驱",
+    6: "RAM",
+}
+
 USB_EJECT_PS1 = r'''
 param([int]$DiskNumber)
 $ErrorActionPreference = 'Stop'
@@ -86,6 +94,10 @@ public class CfgMgr32 {
 '''
 
 
+# ================================================================
+#  工具函数
+# ================================================================
+
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
@@ -122,23 +134,27 @@ def drive_exists(letter):
     return bool(bitmask & (1 << idx))
 
 
-def get_drives():
+def get_drive_type_code(letter):
+    letter = letter.rstrip(":\\").upper()
+    path = f"{letter}:\\"
+    return ctypes.windll.kernel32.GetDriveTypeW(path)
+
+
+def get_drives(min_letter='G'):
     drives = []
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-    type_map = {2: "可移动", 3: "固定", 4: "网络", 5: "光驱", 6: "RAM"}
     for i, ch in enumerate(string.ascii_uppercase):
-        if ch < "G":
+        if ch < min_letter:
             continue
         if bitmask & (1 << i):
             path = f"{ch}:\\"
             dt = ctypes.windll.kernel32.GetDriveTypeW(path)
-            label = type_map.get(dt, "未知")
+            label = DRIVE_TYPE_MAP.get(dt, "未知")
             drives.append((f"{ch}:", label))
     return drives
 
 
 def get_offline_disks():
-    """获取所有脱机状态的磁盘"""
     cmd = (
         'powershell -Command "'
         "Get-Disk | Where-Object { $_.OperationalStatus -eq 'Offline' } | "
@@ -170,7 +186,6 @@ def get_offline_disks():
 
 
 def set_disk_online(disk_number):
-    """将脱机磁盘恢复联机"""
     cmd = (
         f'powershell -Command "'
         f'Set-Disk -Number {disk_number} -IsOffline $false"'
@@ -204,114 +219,334 @@ def eject_volume_api(letter):
     return bool(ok), ("API 弹出指令已发送" if ok else "API IOCTL 失败")
 
 
+# ================================================================
+#  主界面
+# ================================================================
+
+# 按钮配色
+BTN_BG       = "#e8e8e8"
+BTN_FG       = "#1a1a1a"
+BTN_HOVER_BG = "#4a90d9"
+BTN_HOVER_FG = "#ffffff"
+BTN_ACTIVE   = "#3a7bc8"
+
+REC_BG       = "#dae8fc"
+REC_FG       = "#1a1a1a"
+REC_HOVER_BG = "#3b7dd8"
+REC_HOVER_FG = "#ffffff"
+REC_ACTIVE   = "#2e6abb"
+
+STAR_COLOR   = "#d4a017"
+STAR_HOVER   = "#ffe066"
+
+FONT_MAIN    = ("Microsoft YaHei UI", 10)
+FONT_MAIN_B  = ("Microsoft YaHei UI", 10, "bold")
+FONT_SUB     = ("Microsoft YaHei UI", 9)
+FONT_SMALL   = ("Microsoft YaHei UI", 9)
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("移动硬盘清理工具 - 管理员模式")
-        self.root.geometry("680x780")
-        self.root.minsize(600, 680)
+        self.root.geometry("700x660")
+        self.root.minsize(620, 580)
         self._busy = False
         self._svc_was_running = {}
         self.build_ui()
         self.root.after(500, self._check_offline_on_start)
         self.root.mainloop()
 
+    # ------------------------------------------------------------------ UI
+
+    def _mkbtn(self, parent, text, cmd, row, col, colspan=1):
+        """带立体感 + 蓝色悬停的普通按钮"""
+        btn = tk.Button(
+            parent, text=text, command=cmd,
+            font=FONT_MAIN,
+            bg=BTN_BG, fg=BTN_FG,
+            activebackground=BTN_ACTIVE, activeforeground="#fff",
+            relief=tk.RAISED, bd=2,
+            cursor="hand2",
+        )
+        btn.grid(
+            row=row, column=col, columnspan=colspan,
+            sticky="nsew", padx=4, pady=4, ipady=6,
+        )
+        btn.bind("<Enter>", lambda e: btn.config(bg=BTN_HOVER_BG, fg=BTN_HOVER_FG))
+        btn.bind("<Leave>", lambda e: btn.config(bg=BTN_BG, fg=BTN_FG))
+        return btn
+
+    def _make_rec_btn(self, parent, command, row, col):
+        """推荐弹出按钮（浅蓝底色 + 金色★ + 蓝色悬停）"""
+        frm = tk.Frame(parent, bg=REC_BG, relief=tk.RAISED, bd=2, cursor="hand2")
+        frm.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+
+        inner = tk.Frame(frm, bg=REC_BG)
+        inner.pack(expand=True)
+
+        lbl_star = tk.Label(
+            inner, text="★", fg=STAR_COLOR, bg=REC_BG,
+            font=("Segoe UI", 16), cursor="hand2",
+        )
+        lbl_star.pack(pady=(6, 0))
+
+        lbl_title = tk.Label(
+            inner, text="安全弹出（推荐）", fg=REC_FG, bg=REC_BG,
+            font=FONT_MAIN_B, cursor="hand2",
+        )
+        lbl_title.pack()
+
+        lbl_sub = tk.Label(
+            inner, text="停止服务 + 弹出硬盘", fg="#555", bg=REC_BG,
+            font=FONT_SUB, cursor="hand2",
+        )
+        lbl_sub.pack(pady=(0, 6))
+
+        ws = [frm, inner, lbl_star, lbl_title, lbl_sub]
+
+        def _hover_enter(e):
+            for w in ws:
+                w.configure(bg=REC_HOVER_BG)
+            lbl_star.config(fg=STAR_HOVER)
+            lbl_title.config(fg=REC_HOVER_FG)
+            lbl_sub.config(fg="#ccc")
+
+        def _hover_leave(e):
+            try:
+                px = frm.winfo_pointerx() - frm.winfo_rootx()
+                py = frm.winfo_pointery() - frm.winfo_rooty()
+                if 0 <= px <= frm.winfo_width() and 0 <= py <= frm.winfo_height():
+                    return
+            except Exception:
+                pass
+            for w in ws:
+                w.configure(bg=REC_BG)
+            lbl_star.config(fg=STAR_COLOR)
+            lbl_title.config(fg=REC_FG)
+            lbl_sub.config(fg="#555")
+
+        def _click(e):
+            frm.config(relief=tk.SUNKEN)
+            frm.after(80, lambda: frm.config(relief=tk.RAISED))
+            frm.after(100, command)
+
+        for w in ws:
+            w.bind("<Button-1>", _click)
+            w.bind("<Enter>", _hover_enter)
+            w.bind("<Leave>", _hover_leave)
+
+        return frm
+
+    def _small_btn(self, parent, text, cmd, **pack_kw):
+        """辅助小按钮"""
+        btn = tk.Button(
+            parent, text=text, command=cmd,
+            font=FONT_SMALL,
+            bg=BTN_BG, fg=BTN_FG,
+            activebackground=BTN_ACTIVE, activeforeground="#fff",
+            relief=tk.RAISED, bd=1,
+            cursor="hand2", padx=10,
+        )
+        btn.pack(**pack_kw)
+        btn.bind("<Enter>", lambda e: btn.config(bg=BTN_HOVER_BG, fg=BTN_HOVER_FG))
+        btn.bind("<Leave>", lambda e: btn.config(bg=BTN_BG, fg=BTN_FG))
+        return btn
+
+    # ---------- 构建主界面 ----------
+
     def build_ui(self):
+        style = ttk.Style()
+        style.configure("TNotebook.Tab", padding=[14, 6], font=FONT_MAIN)
+
         m = ttk.Frame(self.root, padding=8)
         m.pack(fill="both", expand=True)
 
-        f0 = ttk.LabelFrame(m, text="盘符选择（仅 G: 及之后）", padding=8)
-        f0.pack(fill="x", pady=(0, 4))
+        # ── 盘符选择区 ──
+        self.drive_frame = ttk.LabelFrame(
+            m, text="盘符选择（仅 G: 及之后）", padding=8
+        )
+        self.drive_frame.pack(fill="x", pady=(0, 4))
 
-        drives = get_drives()
+        row1 = ttk.Frame(self.drive_frame)
+        row1.pack(fill="x")
+
+        drives = get_drives('G')
         values = [f"{d[0]}  [{d[1]}]" for d in drives]
         self.drive_var = tk.StringVar(value=values[0] if values else "")
         self.combo = ttk.Combobox(
-            f0, textvariable=self.drive_var,
+            row1, textvariable=self.drive_var,
             values=values, state="readonly",
-            width=18, font=("Consolas", 11)
+            width=18, font=("Consolas", 11),
         )
         self.combo.pack(side="left", padx=(0, 8))
-        ttk.Button(f0, text="刷新盘符", command=self.refresh).pack(side="left")
-        self.status_lbl = ttk.Label(f0, text="", foreground="gray")
+        self.combo.bind("<<ComboboxSelected>>", self._on_drive_selected)
+
+        self._small_btn(row1, "刷新盘符", self.refresh, side="left")
+
+        self.status_lbl = ttk.Label(row1, text="", foreground="gray")
         self.status_lbl.pack(side="left", padx=10)
         if not drives:
             self.status_lbl.config(
                 text="!! 未检测到 G: 及之后的盘符", foreground="red"
             )
 
+        row2 = ttk.Frame(self.drive_frame)
+        row2.pack(fill="x", pady=(6, 0))
+        self.show_def_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row2,
+            text="启用 D: / E: / F: 盘（⚠ 通常为本地硬盘，谨慎操作）",
+            variable=self.show_def_var,
+            command=self._toggle_def,
+        ).pack(side="left")
+
+        # ── Notebook ──
         nb = ttk.Notebook(m)
         nb.pack(fill="x", pady=4)
 
-        # Tab 1: 解除占用 / 弹出
+        # ---------- Tab 1: 解除占用 / 弹出 ----------
         t1 = ttk.Frame(nb, padding=6)
-        nb.add(t1, text=" 解除占用 / 弹出 ")
+        nb.add(t1, text="  解除占用 / 弹出  ")
+        t1.columnconfigure(0, weight=1)
+        t1.columnconfigure(1, weight=1)
 
-        ttk.Button(t1, text="[检测] 检测占用该盘的进程和服务",
-                   command=self.detect).pack(fill="x", pady=2)
-        ttk.Button(t1, text="[停止] 一键停止常见占用服务",
-                   command=self.stop_svc).pack(fill="x", pady=2)
-        ttk.Button(t1, text="[恢复] 恢复已停止的服务",
-                   command=self.start_svc).pack(fill="x", pady=2)
+        self._mkbtn(t1, "检测占用进程和服务", self.detect,          0, 0)
+        self._mkbtn(t1, "一键停止占用服务",   self.stop_svc,        0, 1)
+        self._mkbtn(t1, "恢复已停止的服务",   self.start_svc,       1, 0)
+        self._mkbtn(t1, "恢复脱机磁盘",       self.recover_offline, 1, 1)
 
-        ttk.Separator(t1).pack(fill="x", pady=6)
+        ttk.Separator(t1).grid(row=2, column=0, columnspan=2, sticky="ew", pady=6)
 
-        ttk.Button(t1, text="[安全弹出] 停止服务 + 弹出硬盘（推荐）",
-                   command=self.smart_eject).pack(fill="x", pady=2)
-        ttk.Button(t1, text="[强制弹出] 直接弹出硬盘",
-                   command=self.force_eject).pack(fill="x", pady=2)
+        self._make_rec_btn(t1, self.smart_eject, 3, 0)
+        self._mkbtn(t1, "强制弹出\n直接弹出硬盘", self.force_eject, 3, 1)
 
-        ttk.Separator(t1).pack(fill="x", pady=6)
-
-        self.online_btn = ttk.Button(
-            t1, text="[恢复脱机磁盘] 检测并恢复被标记为脱机的磁盘",
-            command=self.recover_offline
-        )
-        self.online_btn.pack(fill="x", pady=2)
-
-        # Tab 2: 删除系统文件夹
+        # ---------- Tab 2: 删除系统文件夹 ----------
         t2 = ttk.Frame(nb, padding=6)
-        nb.add(t2, text=" 删除系统文件夹 ")
+        nb.add(t2, text="  删除系统文件夹  ")
+        t2.columnconfigure(0, weight=1)
+        t2.columnconfigure(1, weight=1)
 
-        ttk.Button(t2, text="[删除] System Volume Information",
-                   command=self.del_svi).pack(fill="x", pady=2)
-        ttk.Button(t2, text="[删除] $RECYCLE.BIN",
-                   command=self.del_rec).pack(fill="x", pady=2)
-        ttk.Button(t2, text="[一键删除] 以上两个文件夹",
-                   command=self.del_both).pack(fill="x", pady=2)
+        self._mkbtn(t2, "删除\nSystem Volume Information", self.del_svi, 0, 0)
+        self._mkbtn(t2, "删除\n$RECYCLE.BIN",              self.del_rec, 0, 1)
+        self._mkbtn(t2, "一键删除以上两个文件夹",          self.del_both, 1, 0, colspan=2)
 
-        # Tab 3: SYSTEM 写入权限
+        # ---------- Tab 3: SYSTEM 写入权限 ----------
         t3 = ttk.Frame(nb, padding=6)
-        nb.add(t3, text=" SYSTEM 写入权限 ")
+        nb.add(t3, text="  SYSTEM 写入权限  ")
+        t3.columnconfigure(0, weight=1)
+        t3.columnconfigure(1, weight=1)
 
-        ttk.Button(t3, text="[禁止] 禁止 SYSTEM 写入",
-                   command=self.deny_write).pack(fill="x", pady=2)
-        ttk.Button(t3, text="[恢复] 恢复 SYSTEM 写入",
-                   command=self.allow_write).pack(fill="x", pady=2)
+        self._mkbtn(t3, "禁止 SYSTEM 写入", self.deny_write,  0, 0)
+        self._mkbtn(t3, "恢复 SYSTEM 写入", self.allow_write, 0, 1)
 
-        hint_text = (
-            "提示：禁止写入后，系统服务将无法在该盘创建任何文件。"
-            "\n如需恢复，请在拔盘前点击【恢复】按钮。"
-        )
-        ttk.Label(t3, foreground="gray", text=hint_text).pack(
-            anchor="w", pady=(8, 0)
-        )
+        ttk.Label(
+            t3, foreground="gray",
+            text="提示：禁止写入后，系统服务将无法在该盘创建任何文件。"
+                 "\n如需恢复，请在拔盘前点击【恢复】按钮。",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        # 日志
+        # ── 日志 ──
         f4 = ttk.LabelFrame(m, text="执行日志", padding=4)
         f4.pack(fill="both", expand=True, pady=(4, 0))
 
         self.log = scrolledtext.ScrolledText(
-            f4, height=14, font=("Consolas", 9), wrap=tk.WORD
+            f4, height=12, font=("Consolas", 9), wrap=tk.WORD
         )
         self.log.pack(fill="both", expand=True)
-        ttk.Button(f4, text="清空日志",
-                   command=lambda: self.log.delete("1.0", tk.END)
-                   ).pack(anchor="e", pady=(2, 0))
+
+        self._small_btn(
+            f4, "清空日志",
+            lambda: self.log.delete("1.0", tk.END),
+            anchor="e", pady=(2, 0),
+        )
 
         self.log_msg("[OK] 工具已启动（管理员模式）")
         ds = ", ".join(f"{d[0]}[{d[1]}]" for d in drives) if drives else "无"
         self.log_msg(f"可用盘符：{ds}\n")
+
+        self._on_drive_selected()
+
+    # ========== D/E/F 开关 ==========
+
+    def _toggle_def(self):
+        if self.show_def_var.get():
+            msg = (
+                "⚠ 安全提示\n\n"
+                "D: / E: / F: 通常是本地固定硬盘分区。\n\n"
+                "对本地硬盘执行弹出操作可能导致：\n"
+                "• 系统不稳定或蓝屏\n"
+                "• 正在运行的程序崩溃\n"
+                "• 该分区上的数据丢失\n\n"
+                "请确认你了解风险后再操作。\n\n"
+                "确定要启用吗？"
+            )
+            if not messagebox.askyesno("安全提示", msg, icon="warning"):
+                self.show_def_var.set(False)
+                return
+            self.drive_frame.config(text="盘符选择（D: 及之后 ⚠ 含本地硬盘）")
+            self.log_msg("[设置] 已启用 D:/E:/F: 盘显示（请谨慎操作）")
+        else:
+            self.drive_frame.config(text="盘符选择（仅 G: 及之后）")
+            self.log_msg("[设置] 已关闭 D:/E:/F: 盘显示")
+        self.refresh()
+
+    def _on_drive_selected(self, event=None):
+        if self._busy:
+            return
+        v = self.drive_var.get()
+        if not v:
+            return
+        if "[固定]" in v:
+            self.status_lbl.config(
+                text="⚠ 本地固定硬盘 — 弹出需谨慎", foreground="red"
+            )
+        elif "[网络]" in v:
+            self.status_lbl.config(
+                text="⚠ 网络驱动器 — 弹出需谨慎", foreground="orange"
+            )
+        elif "[光驱]" in v:
+            self.status_lbl.config(text="光驱", foreground="gray")
+        else:
+            self.status_lbl.config(text="", foreground="gray")
+
+    # ========== 驱动器安全检查 ==========
+
+    def _check_drive_safety(self, d):
+        dt = get_drive_type_code(d)
+        type_name = DRIVE_TYPE_MAP.get(dt, "未知")
+
+        if dt == 3:
+            msg = (
+                f"⚠ 安全警告\n\n"
+                f"{d}\\ 被识别为【{type_name}硬盘（本地磁盘）】，\n"
+                f"不是可移动设备！\n\n"
+                f"弹出本地固定硬盘可能导致：\n"
+                f"• 系统不稳定、蓝屏或崩溃\n"
+                f"• 正在运行的程序意外关闭\n"
+                f"• 该磁盘分区上的数据丢失\n\n"
+                f"强烈建议：仅对 USB 移动硬盘 / U盘 执行弹出。\n\n"
+                f"是否仍要继续？"
+            )
+            return messagebox.askyesno("⚠ 安全警告", msg, icon="warning")
+
+        elif dt == 4:
+            msg = (
+                f"⚠ 安全提示\n\n"
+                f"{d}\\ 被识别为【{type_name}驱动器】，\n"
+                f"不是本地可移动设备！\n\n"
+                f"断开网络驱动器可能导致：\n"
+                f"• 正在访问的网络文件 / 程序中断\n"
+                f"• 需要重新映射网络驱动器\n\n"
+                f"是否仍要继续？"
+            )
+            return messagebox.askyesno("⚠ 安全提示", msg, icon="warning")
+
+        elif dt == 5:
+            msg = f"提示：{d}\\ 是光驱，弹出将打开光驱托盘。\n\n继续？"
+            return messagebox.askyesno("提示", msg)
+
+        return True
 
     # ========== 启动时检查脱机磁盘 ==========
 
@@ -341,7 +576,10 @@ class App:
                     foreground="orange"
                 ))
             elif all_offline:
-                self.log_msg(f"[信息] 检测到 {len(all_offline)} 个脱机磁盘（非USB），可能为正常状态。\n")
+                self.log_msg(
+                    f"[信息] 检测到 {len(all_offline)} 个脱机磁盘"
+                    f"（非USB），可能为正常状态。\n"
+                )
 
     # ========== 通用 ==========
 
@@ -357,21 +595,23 @@ class App:
         return d
 
     def refresh(self):
-        drives = get_drives()
+        min_letter = 'D' if self.show_def_var.get() else 'G'
+        drives = get_drives(min_letter)
         values = [f"{d[0]}  [{d[1]}]" for d in drives]
         self.combo["values"] = values
+
         cur = self.drive_var.get().split()[0] if self.drive_var.get() else ""
         hit = next((v for v in values if v.startswith(cur)),
                    values[0] if values else "")
         self.drive_var.set(hit)
+
         ds = ", ".join(f"{d[0]}[{d[1]}]" for d in drives) if drives else "无"
         self.log_msg(f"[刷新] 盘符：{ds}")
         if not drives:
             self.status_lbl.config(text="!! 未检测到可用盘符", foreground="red")
         else:
-            self.status_lbl.config(text="", foreground="gray")
+            self._on_drive_selected()
 
-        # 同时检查脱机磁盘
         threading.Thread(target=self._do_check_offline_start, daemon=True).start()
 
     def log_msg(self, msg):
@@ -405,8 +645,7 @@ class App:
                 self.log_msg(f"[异常] {e}")
             finally:
                 self._busy = False
-                self.root.after(0, lambda: self.status_lbl.config(
-                    text="", foreground="gray"))
+                self.root.after(0, lambda: self._on_drive_selected())
 
         threading.Thread(target=wrapper, daemon=True).start()
 
@@ -449,7 +688,9 @@ class App:
 
     def _get_disk_number(self, letter):
         rc, out, _ = run_cmd(
-            f'powershell -Command "(Get-Partition -DriveLetter {letter} -ErrorAction Stop).DiskNumber"',
+            f'powershell -Command "'
+            f"(Get-Partition -DriveLetter {letter} -ErrorAction Stop).DiskNumber"
+            f'"',
             timeout=10
         )
         if rc == 0 and out.strip().isdigit():
@@ -494,7 +735,7 @@ class App:
         else:
             self.log_msg("    [!] 无法获取磁盘号，USB 安全移除可能不可用")
 
-        # ── 方法 1：USB 安全移除（最佳：盘符消失 + 硬盘停转）──
+        # ── 方法 1：USB 安全移除 ──
         if disk_number is not None:
             self.log_msg("\n  方法1: USB 安全移除 (CM_Request_Device_Eject) ...")
             usb_ok = self._usb_safe_remove(disk_number)
@@ -541,7 +782,6 @@ class App:
         self.log_msg("    盘符仍在，尝试下一方法...")
 
         # ── 方法 4：Set-Disk -IsOffline + USB 安全移除 ──
-        # 注意：IsOffline 会被 Windows 记住，必须追加 USB 移除来避免后遗症
         self.log_msg("\n  方法4: Set-Disk -IsOffline + USB 安全移除 ...")
         self.log_msg("    [注意] 此方法如果 USB 移除失败，下次插入可能需要手动恢复联机")
         cmd = (
@@ -702,6 +942,9 @@ class App:
         d = self.get_drive()
         if not d:
             return
+        if not self._check_drive_safety(d):
+            self.log_msg(f"[取消] 用户取消了对 {d} 的弹出操作\n")
+            return
         msg = (
             f"将执行以下步骤：\n\n"
             f"1. 停止常见占用服务\n"
@@ -751,6 +994,9 @@ class App:
     def force_eject(self):
         d = self.get_drive()
         if not d:
+            return
+        if not self._check_drive_safety(d):
+            self.log_msg(f"[取消] 用户取消了对 {d} 的弹出操作\n")
             return
         msg = f"跳过停止服务，直接弹出 {d}？"
         if not messagebox.askyesno("强制弹出", msg):
@@ -858,6 +1104,10 @@ class App:
         self.exec_cmd(f'icacls {d}\\ /remove:d "SYSTEM" /T /C')
         self.log_msg("[OK] 已恢复\n")
 
+
+# ================================================================
+#  入口
+# ================================================================
 
 if __name__ == "__main__":
     if not is_admin():

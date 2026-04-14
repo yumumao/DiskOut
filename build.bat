@@ -81,30 +81,68 @@ if errorlevel 1 (
 )
 echo [OK] PyInstaller 就绪
 
-REM ── 生成图标（可选）──
+REM ── 生成 / 检测图标 ──
 echo.
-echo [2/4] 生成图标 ...
-if exist "gen_icon.py" (
-    %PYTHON_CMD% gen_icon.py 2>nul
-    if exist "diskout.ico" (
-        echo [OK] 图标已生成
-        set "ICON_OPT=--icon=diskout.ico"
-    ) else (
-        echo [跳过] 图标生成失败（可能缺少 Pillow: %PYTHON_CMD% -m pip install Pillow）
-        set "ICON_OPT="
-    )
-) else (
-    echo [跳过] gen_icon.py 不存在，使用默认图标
-    set "ICON_OPT="
+echo [2/4] 准备图标 ...
+set "ICON_OPT="
+
+REM 优先级1：用户手动放置的 diskout.ico（最高优先级）
+if exist "diskout.ico" (
+    echo [OK] 检测到已有 diskout.ico，直接使用
+    set "ICON_OPT=--icon=diskout.ico"
+    goto :ICON_DONE
 )
+
+REM 优先级2：通过 gen_icon.py 自动生成
+if not exist "gen_icon.py" (
+    echo [跳过] gen_icon.py 不存在且无 diskout.ico，将使用默认图标
+    echo        如需自定义图标，请将 diskout.ico 放到当前目录
+    goto :ICON_DONE
+)
+
+REM gen_icon.py 存在，确保 Pillow 已安装
+echo [INFO] 检测 Pillow 依赖 ...
+%PYTHON_CMD% -c "import PIL" >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] Pillow 未安装，正在自动安装 ...
+    %PYTHON_CMD% -m pip install Pillow -q
+    if errorlevel 1 (
+        echo [跳过] Pillow 安装失败，将使用默认图标
+        echo        手动安装: %PYTHON_CMD% -m pip install Pillow
+        goto :ICON_DONE
+    )
+    echo [OK] Pillow 安装成功
+) else (
+    echo [OK] Pillow 已就绪
+)
+
+REM 运行图标生成脚本
+echo [INFO] 运行 gen_icon.py 生成图标 ...
+%PYTHON_CMD% gen_icon.py
+if errorlevel 1 (
+    echo [跳过] gen_icon.py 运行出错，将使用默认图标
+    goto :ICON_DONE
+)
+if exist "diskout.ico" (
+    echo [OK] 图标生成成功
+    set "ICON_OPT=--icon=diskout.ico"
+) else (
+    echo [跳过] gen_icon.py 运行完毕但未生成 diskout.ico，将使用默认图标
+)
+
+:ICON_DONE
 
 REM ── 打包 ──
 echo.
 echo [3/4] 正在打包为单文件 EXE ...
+if defined ICON_OPT (
+    echo        图标: diskout.ico
+) else (
+    echo        图标: 系统默认
+)
 echo        这可能需要 1~3 分钟，请耐心等待 ...
 echo.
 
-REM 使用 -m PyInstaller 确保调用当前 Python 环境下的 PyInstaller
 %PYTHON_CMD% -m PyInstaller --onefile --windowed --uac-admin --name DiskOut %ICON_OPT% --clean diskout.py
 if errorlevel 1 (
     echo.
@@ -129,9 +167,19 @@ set /p CLEANUP="是否清理打包临时文件 (build/, *.spec)? [Y/n]: "
 if /i "%CLEANUP%"=="n" goto :DONE
 if exist "build" rd /s /q build
 if exist "DiskOut.spec" del /q DiskOut.spec
-if exist "diskout.ico" del /q diskout.ico
 if exist "__pycache__" rd /s /q __pycache__
 echo [OK] 临时文件已清理
+
+REM 图标文件单独询问（用户可能想保留）
+if exist "diskout.ico" (
+    set /p CLEAN_ICON="是否删除 diskout.ico? [y/N]: "
+    if /i "!CLEAN_ICON!"=="y" (
+        del /q diskout.ico
+        echo [OK] diskout.ico 已删除
+    ) else (
+        echo [保留] diskout.ico（下次打包可直接复用）
+    )
+)
 
 :DONE
 echo.
