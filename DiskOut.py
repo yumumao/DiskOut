@@ -15,6 +15,9 @@ from tkinter import ttk, messagebox, scrolledtext
 from ctypes import wintypes
 import threading
 
+# ── 版本号（修改此处即可更新界面右上角显示） ──
+APP_VERSION = "2.3.3"
+
 SERVICES = [
     ("WSearch",       "Windows Search"),
     ("SysMain",       "SysMain"),
@@ -31,6 +34,8 @@ DRIVE_TYPE_MAP = {
     5: "光驱",
     6: "RAM",
 }
+
+USB_BUS_TYPES = {"USB", "USB3"}
 
 USB_EJECT_PS1 = r'''
 param([int]$DiskNumber)
@@ -132,22 +137,82 @@ def drive_exists(letter):
 
 def get_drive_type_code(letter):
     letter = letter.rstrip(":\\").upper()
-    path = f"{letter}:\\"
-    return ctypes.windll.kernel32.GetDriveTypeW(path)
+    return ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\")
 
 
-def get_drives(min_letter='G'):
-    drives = []
+# ── 快速获取盘符（仅 Win32 API，不调 PowerShell，瞬间完成） ──
+def get_drives_fast(min_letter='G'):
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    drives = []
     for i, ch in enumerate(string.ascii_uppercase):
         if ch < min_letter:
             continue
         if bitmask & (1 << i):
-            path = f"{ch}:\\"
-            dt = ctypes.windll.kernel32.GetDriveTypeW(path)
-            label = DRIVE_TYPE_MAP.get(dt, "未知")
-            drives.append((f"{ch}:", label))
+            dt = ctypes.windll.kernel32.GetDriveTypeW(f"{ch}:\\")
+            drives.append((f"{ch}:", DRIVE_TYPE_MAP.get(dt, "未知")))
     return drives
+
+
+# ── 批量获取所有盘符对应的物理磁盘总线类型（需要 PowerShell，较慢） ──
+def get_drive_bus_types():
+    cmd = (
+        'powershell -Command "'
+        "Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object { "
+        "try { $dk = $_ | Get-Disk -ErrorAction Stop; "
+        "Write-Output ('{0}|{1}' -f $_.DriveLetter, $dk.BusType) "
+        "} catch {} "
+        '}"'
+    )
+    rc, out, _ = run_cmd(cmd, timeout=15)
+    result = {}
+    if rc == 0 and out.strip():
+        for line in out.strip().splitlines():
+            parts = line.strip().split('|', 1)
+            if len(parts) == 2 and parts[0]:
+                result[parts[0].upper()] = parts[1].strip()
+    return result
+
+
+# ── 获取单个盘符的总线类型 ──
+def get_drive_bus_type(letter):
+    letter = letter.rstrip(":\\").upper()
+    cmd = (
+        f'powershell -Command "'
+        f"try {{ $p = Get-Partition -DriveLetter {letter} -ErrorAction Stop; "
+        f"($p | Get-Disk).BusType }} catch {{ Write-Output 'Unknown' }}"
+        f'"'
+    )
+    rc, out, _ = run_cmd(cmd, timeout=10)
+    if rc == 0 and out.strip():
+        return out.strip()
+    return "Unknown"
+
+
+# ── 完整获取盘符（含 PowerShell 总线类型检测） ──
+def get_drives_full(min_letter='G'):
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    candidates = []
+    for i, ch in enumerate(string.ascii_uppercase):
+        if ch < min_letter:
+            continue
+        if bitmask & (1 << i):
+            dt = ctypes.windll.kernel32.GetDriveTypeW(f"{ch}:\\")
+            candidates.append((ch, dt))
+    if not candidates:
+        return [], {}
+
+    bus_types = get_drive_bus_types()
+    drives = []
+    for ch, dt in candidates:
+        bus = bus_types.get(ch, "").upper()
+        if dt == 3 and bus in USB_BUS_TYPES:
+            label = "USB硬盘"
+        elif dt == 2 and bus in USB_BUS_TYPES:
+            label = "可移动"
+        else:
+            label = DRIVE_TYPE_MAP.get(dt, "未知")
+        drives.append((f"{ch}:", label))
+    return drives, bus_types
 
 
 def get_offline_disks():
@@ -171,10 +236,8 @@ def get_offline_disks():
                     bus = parts[3]
                     size_gb = size_bytes / (1024**3)
                     disks.append({
-                        "number": num,
-                        "name": name,
-                        "size_gb": size_gb,
-                        "bus": bus,
+                        "number": num, "name": name,
+                        "size_gb": size_gb, "bus": bus,
                     })
                 except (ValueError, IndexError):
                     pass
@@ -186,7 +249,7 @@ def set_disk_online(disk_number):
         f'powershell -Command "'
         f'Set-Disk -Number {disk_number} -IsOffline $false"'
     )
-    rc, out, err = run_cmd(cmd, timeout=15)
+    rc, _, _ = run_cmd(cmd, timeout=15)
     return rc == 0
 
 
@@ -229,42 +292,41 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("移动硬盘清理工具 - 管理员模式")
-        self.root.geometry("560x660")
-        self.root.minsize(380, 520)
+        # ── 宽度 +60 → 660，高度保持 540 ──
+        self.root.geometry("560x690")
+        self.root.minsize(460, 530)
         self._busy = False
         self._svc_was_running = {}
+        self._bus_cache = {}        # 总线类型缓存 {'G': 'USB', 'C': 'NVMe', ...}
+        self._detecting = False     # 是否正在后台检测总线类型
         self.build_ui()
+        # 先显示界面，再后台检测
+        self.root.after(100, self._start_bus_detection)
         self.root.after(500, self._check_offline_on_start)
         self.root.mainloop()
 
-    # ── 构建推荐按钮（Frame 模拟，★ 单独着色） ──
+    # ── 构建推荐按钮 ──
     def _make_rec_btn(self, parent, command):
         frm = tk.Frame(parent, bg=REC_BG, relief=tk.RAISED, bd=2, cursor="hand2")
-
         inner = tk.Frame(frm, bg=REC_BG)
         inner.pack(expand=True, pady=(4, 3))
-
         line1 = tk.Frame(inner, bg=REC_BG)
         line1.pack()
-
         lbl_star = tk.Label(
             line1, text="★", fg=STAR_COLOR, bg=REC_BG,
             font=("Segoe UI", 13), cursor="hand2",
         )
         lbl_star.pack(side="left")
-
         lbl_title = tk.Label(
             line1, text=" 安全弹出（推荐）", fg=REC_FG, bg=REC_BG,
             font=("Microsoft YaHei UI", 11, "bold"), cursor="hand2",
         )
         lbl_title.pack(side="left")
-
         lbl_sub = tk.Label(
             inner, text="停止服务 + 弹出硬盘", fg="#555", bg=REC_BG,
             font=("Microsoft YaHei UI", 10), cursor="hand2",
         )
         lbl_sub.pack()
-
         ws = [frm, inner, line1, lbl_star, lbl_title, lbl_sub]
 
         def _hover_enter(e):
@@ -297,22 +359,15 @@ class App:
             w.bind("<Button-1>", _click)
             w.bind("<Enter>", _hover_enter)
             w.bind("<Leave>", _hover_leave)
-
         return frm
 
     # ------------------------------------------------------------------ UI
     def build_ui(self):
         style = ttk.Style()
         style.theme_use("clam")
-
-        # ── 统一字体 ──
         UI_FONT = ("Microsoft YaHei UI", 11)
         UI_BOLD = ("Microsoft YaHei UI", 11, "bold")
-
-        # 修改 Tk 全局默认字体
         self.root.option_add("*Font", UI_FONT)
-
-        # ttk 各控件逐一设置
         style.configure("TButton",           font=UI_FONT)
         style.configure("TLabel",            font=UI_FONT)
         style.configure("TCheckbutton",      font=UI_FONT)
@@ -324,6 +379,14 @@ class App:
         m = ttk.Frame(self.root, padding=8)
         m.pack(fill="both", expand=True)
 
+        # ── 右上角版本号（浅灰色） ──
+        ver_lbl = ttk.Label(
+            m, text=f"v{APP_VERSION}",
+            foreground="#b0b0b0",
+            font=("Consolas", 9),
+        )
+        ver_lbl.pack(anchor="e", pady=(0, 2))
+
         # ── 盘符选择区 ──
         self.drive_frame = ttk.LabelFrame(
             m, text="盘符选择（仅 G: 及之后）", padding=8
@@ -333,7 +396,8 @@ class App:
         row1 = ttk.Frame(self.drive_frame)
         row1.pack(fill="x")
 
-        drives = get_drives('G')
+        # ── 启动时用快速检测（不调 PowerShell），界面秒开 ──
+        drives = get_drives_fast('G')
         values = [f"{d[0]}  [{d[1]}]" for d in drives]
         self.drive_var = tk.StringVar(value=values[0] if values else "")
         self.combo = ttk.Combobox(
@@ -351,6 +415,10 @@ class App:
             self.status_lbl.config(
                 text="!! 未检测到 G: 及之后的盘符", foreground="red"
             )
+        else:
+            self.status_lbl.config(
+                text="正在识别磁盘类型...", foreground="blue"
+            )
 
         row2 = ttk.Frame(self.drive_frame)
         row2.pack(fill="x", pady=(6, 0))
@@ -365,7 +433,6 @@ class App:
         # ── Notebook ──
         nb = ttk.Notebook(m)
         nb.pack(fill="x", pady=4)
-
         gk = dict(sticky="nsew", padx=3, pady=3, ipady=2)
 
         # ---------- Tab 1: 解除占用 / 弹出 ----------
@@ -374,34 +441,20 @@ class App:
         t1.columnconfigure(0, weight=1)
         t1.columnconfigure(1, weight=1)
 
-        ttk.Button(
-            t1, text="检测占用进程和服务",
-            command=self.detect
-        ).grid(row=0, column=0, **gk)
-        ttk.Button(
-            t1, text="一键停止占用服务",
-            command=self.stop_svc
-        ).grid(row=0, column=1, **gk)
-        ttk.Button(
-            t1, text="恢复已停止的服务",
-            command=self.start_svc
-        ).grid(row=1, column=0, **gk)
-        ttk.Button(
-            t1, text="恢复脱机磁盘",
-            command=self.recover_offline
-        ).grid(row=1, column=1, **gk)
-
-        ttk.Separator(t1).grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=4
-        )
+        ttk.Button(t1, text="检测占用进程和服务",
+                   command=self.detect).grid(row=0, column=0, **gk)
+        ttk.Button(t1, text="一键停止占用服务",
+                   command=self.stop_svc).grid(row=0, column=1, **gk)
+        ttk.Button(t1, text="恢复已停止的服务",
+                   command=self.start_svc).grid(row=1, column=0, **gk)
+        ttk.Button(t1, text="恢复脱机磁盘",
+                   command=self.recover_offline).grid(row=1, column=1, **gk)
+        ttk.Separator(t1).grid(row=2, column=0, columnspan=2, sticky="ew", pady=4)
 
         rec_btn = self._make_rec_btn(t1, self.smart_eject)
         rec_btn.grid(row=3, column=0, sticky="nsew", padx=3, pady=3)
-
-        ttk.Button(
-            t1, text="强制弹出\n直接弹出硬盘",
-            command=self.force_eject
-        ).grid(row=3, column=1, **gk)
+        ttk.Button(t1, text="强制弹出\n直接弹出硬盘",
+                   command=self.force_eject).grid(row=3, column=1, **gk)
 
         # ---------- Tab 2: 删除系统文件夹 ----------
         t2 = ttk.Frame(nb, padding=6)
@@ -409,18 +462,12 @@ class App:
         t2.columnconfigure(0, weight=1)
         t2.columnconfigure(1, weight=1)
 
-        ttk.Button(
-            t2, text="删除\nSystem Volume Information",
-            command=self.del_svi
-        ).grid(row=0, column=0, **gk)
-        ttk.Button(
-            t2, text="删除\n$RECYCLE.BIN",
-            command=self.del_rec
-        ).grid(row=0, column=1, **gk)
-        ttk.Button(
-            t2, text="一键删除以上两个文件夹",
-            command=self.del_both
-        ).grid(row=1, column=0, columnspan=2, **gk)
+        ttk.Button(t2, text="删除\nSystem Volume Information",
+                   command=self.del_svi).grid(row=0, column=0, **gk)
+        ttk.Button(t2, text="删除\n$RECYCLE.BIN",
+                   command=self.del_rec).grid(row=0, column=1, **gk)
+        ttk.Button(t2, text="一键删除以上两个文件夹",
+                   command=self.del_both).grid(row=1, column=0, columnspan=2, **gk)
 
         # ---------- Tab 3: SYSTEM 写入权限 ----------
         t3 = ttk.Frame(nb, padding=6)
@@ -428,38 +475,81 @@ class App:
         t3.columnconfigure(0, weight=1)
         t3.columnconfigure(1, weight=1)
 
-        ttk.Button(
-            t3, text="禁止 SYSTEM 写入",
-            command=self.deny_write
-        ).grid(row=0, column=0, **gk)
-        ttk.Button(
-            t3, text="恢复 SYSTEM 写入",
-            command=self.allow_write
-        ).grid(row=0, column=1, **gk)
-
+        ttk.Button(t3, text="禁止 SYSTEM 写入",
+                   command=self.deny_write).grid(row=0, column=0, **gk)
+        ttk.Button(t3, text="恢复 SYSTEM 写入",
+                   command=self.allow_write).grid(row=0, column=1, **gk)
         ttk.Label(
             t3, foreground="gray",
             text="提示：禁止写入后，系统服务将无法在该盘创建任何文件。"
                  "\n如需恢复，请在拔盘前点击【恢复】按钮。"
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        # ── 日志 ──
+        # ── 日志区域 ──
         f4 = ttk.LabelFrame(m, text="执行日志", padding=4)
         f4.pack(fill="both", expand=True, pady=(4, 0))
 
+        # ── 先 pack 底部按钮栏（保证窗口再小也能显示） ──
+        btn_bar = ttk.Frame(f4)
+        btn_bar.pack(side="bottom", fill="x", pady=(2, 0))
+        ttk.Button(
+            btn_bar, text="清空日志",
+            command=lambda: self.log.delete("1.0", tk.END)
+        ).pack(anchor="e")
+
+        # ── 再 pack 日志文本框（填满剩余空间） ──
         self.log = scrolledtext.ScrolledText(
-            f4, height=12, font=("Consolas", 10), wrap=tk.WORD
+            f4, height=8, font=("Consolas", 10), wrap=tk.WORD
         )
         self.log.pack(fill="both", expand=True)
-        ttk.Button(f4, text="清空日志",
-                   command=lambda: self.log.delete("1.0", tk.END)
-                   ).pack(anchor="e", pady=(2, 0))
 
         self.log_msg("[OK] 工具已启动（管理员模式）")
         ds = ", ".join(f"{d[0]}[{d[1]}]" for d in drives) if drives else "无"
-        self.log_msg(f"可用盘符：{ds}\n")
+        self.log_msg(f"检测到盘符：{ds}")
+        self.log_msg("正在后台识别磁盘总线类型...\n")
 
-        self._on_drive_selected()
+    # ========== 后台总线类型检测 ==========
+
+    def _start_bus_detection(self):
+        """启动后台 PowerShell 检测磁盘总线类型"""
+        self._detecting = True
+        threading.Thread(target=self._do_bus_detection, daemon=True).start()
+
+    def _do_bus_detection(self):
+        min_letter = 'D' if self.show_def_var.get() else 'G'
+        drives, bus_types = get_drives_full(min_letter)
+        self._bus_cache = bus_types
+        self.root.after(0, lambda: self._apply_bus_detection(drives))
+
+    def _apply_bus_detection(self, drives):
+        """后台检测完成，更新 UI"""
+        self._detecting = False
+        values = [f"{d[0]}  [{d[1]}]" for d in drives]
+
+        cur = self.drive_var.get().split()[0] if self.drive_var.get() else ""
+        self.combo["values"] = values
+        hit = next((v for v in values if v.startswith(cur)),
+                   values[0] if values else "")
+        self.drive_var.set(hit)
+
+        ds = ", ".join(f"{d[0]}[{d[1]}]" for d in drives) if drives else "无"
+        self.log_msg(f"[识别完成] 盘符：{ds}\n")
+
+        if not drives:
+            self.status_lbl.config(text="!! 未检测到可用盘符", foreground="red")
+        else:
+            self._on_drive_selected()
+
+    # ========== 获取总线类型（带缓存） ==========
+
+    def _get_bus_type(self, letter):
+        """优先用缓存，缓存没有则单独查询"""
+        letter = letter.rstrip(":\\").upper()
+        if letter in self._bus_cache:
+            return self._bus_cache[letter]
+        bus = get_drive_bus_type(letter)
+        self._bus_cache[letter] = bus
+        return bus
 
     # ========== D/E/F 开关 ==========
 
@@ -491,16 +581,23 @@ class App:
         v = self.drive_var.get()
         if not v:
             return
+        if self._detecting:
+            self.status_lbl.config(text="正在识别磁盘类型...", foreground="blue")
+            return
         if "[固定]" in v:
             self.status_lbl.config(
-                text="⚠ 本地固定硬盘 — 弹出需谨慎", foreground="red"
+                text="⚠ 固定硬盘 谨慎操作", foreground="red"
             )
         elif "[网络]" in v:
             self.status_lbl.config(
-                text="⚠ 网络驱动器 — 弹出需谨慎", foreground="orange"
+                text="⚠ 网络硬盘 谨慎操作", foreground="#b34700"
             )
         elif "[光驱]" in v:
             self.status_lbl.config(text="光驱", foreground="gray")
+        elif "[USB硬盘]" in v:
+            self.status_lbl.config(text="USB 移动硬盘", foreground="green")
+        elif "[可移动]" in v:
+            self.status_lbl.config(text="可移动设备", foreground="green")
         else:
             self.status_lbl.config(text="", foreground="gray")
 
@@ -508,13 +605,17 @@ class App:
 
     def _check_drive_safety(self, d):
         dt = get_drive_type_code(d)
-        type_name = DRIVE_TYPE_MAP.get(dt, "未知")
+        bus = self._get_bus_type(d[0])
+        is_usb = bus.upper() in USB_BUS_TYPES
 
-        if dt == 3:
+        if dt == 3 and is_usb:
+            return True
+
+        if dt == 3 and not is_usb:
             msg = (
                 f"⚠ 安全警告\n\n"
-                f"{d}\\ 被识别为【{type_name}硬盘（本地磁盘）】，\n"
-                f"不是可移动设备！\n\n"
+                f"{d}\\ 被识别为【本地固定硬盘】（总线: {bus}），\n"
+                f"不是 USB 可移动设备！\n\n"
                 f"弹出本地固定硬盘可能导致：\n"
                 f"• 系统不稳定、蓝屏或崩溃\n"
                 f"• 正在运行的程序意外关闭\n"
@@ -527,7 +628,7 @@ class App:
         elif dt == 4:
             msg = (
                 f"⚠ 安全提示\n\n"
-                f"{d}\\ 被识别为【{type_name}驱动器】，\n"
+                f"{d}\\ 被识别为【网络驱动器】，\n"
                 f"不是本地可移动设备！\n\n"
                 f"断开网络驱动器可能导致：\n"
                 f"• 正在访问的网络文件 / 程序中断\n"
@@ -551,7 +652,6 @@ class App:
         offline = get_offline_disks()
         if offline:
             usb_offline = [d for d in offline if d["bus"] in ("USB", "USB3")]
-            all_offline = offline
             if usb_offline:
                 info_lines = []
                 for d in usb_offline:
@@ -564,14 +664,13 @@ class App:
                     self.log_msg(ln)
                 self.log_msg("这可能是上次使用 Set-Disk -IsOffline 弹出导致的。")
                 self.log_msg("点击【恢复脱机磁盘】按钮可恢复。\n")
-
                 self.root.after(0, lambda: self.status_lbl.config(
                     text=f"⚠ 检测到 {len(usb_offline)} 个脱机USB磁盘",
                     foreground="orange"
                 ))
-            elif all_offline:
+            elif offline:
                 self.log_msg(
-                    f"[信息] 检测到 {len(all_offline)} 个脱机磁盘"
+                    f"[信息] 检测到 {len(offline)} 个脱机磁盘"
                     f"（非USB），可能为正常状态。\n"
                 )
 
@@ -590,22 +689,25 @@ class App:
 
     def refresh(self):
         min_letter = 'D' if self.show_def_var.get() else 'G'
-        drives = get_drives(min_letter)
+        # 先用快速检测立即刷新列表
+        drives = get_drives_fast(min_letter)
         values = [f"{d[0]}  [{d[1]}]" for d in drives]
         self.combo["values"] = values
-
         cur = self.drive_var.get().split()[0] if self.drive_var.get() else ""
         hit = next((v for v in values if v.startswith(cur)),
                    values[0] if values else "")
         self.drive_var.set(hit)
 
         ds = ", ".join(f"{d[0]}[{d[1]}]" for d in drives) if drives else "无"
-        self.log_msg(f"[刷新] 盘符：{ds}")
+        self.log_msg(f"[刷新] 盘符：{ds}（正在识别类型...）")
+
         if not drives:
             self.status_lbl.config(text="!! 未检测到可用盘符", foreground="red")
         else:
-            self._on_drive_selected()
+            self.status_lbl.config(text="正在识别磁盘类型...", foreground="blue")
 
+        # 后台完整检测
+        self._start_bus_detection()
         threading.Thread(target=self._do_check_offline_start, daemon=True).start()
 
     def log_msg(self, msg):
@@ -684,8 +786,7 @@ class App:
         rc, out, _ = run_cmd(
             f'powershell -Command "'
             f"(Get-Partition -DriveLetter {letter} -ErrorAction Stop).DiskNumber"
-            f'"',
-            timeout=10
+            f'"', timeout=10
         )
         if rc == 0 and out.strip().isdigit():
             return int(out.strip())
@@ -830,6 +931,11 @@ class App:
         self.log_msg(f"  检测占用 {d}\\ 的进程和服务")
         self.log_msg(f"{'='*50}")
 
+        bus = self._get_bus_type(d[0])
+        dt = get_drive_type_code(d)
+        type_name = DRIVE_TYPE_MAP.get(dt, "未知")
+        self.log_msg(f"\n  磁盘类型: {type_name}  总线: {bus}")
+
         self.log_msg("\n[1] 在该盘上运行的进程：")
         cmd = (
             'powershell -Command "'
@@ -877,7 +983,6 @@ class App:
                 self.log_msg("    未查到占用记录")
         else:
             self.log_msg("    不可用（需先运行 openfiles /local on 并重启）")
-
         self.log_msg("")
 
     # ========== 服务管理 ==========
