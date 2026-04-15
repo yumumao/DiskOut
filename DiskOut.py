@@ -16,7 +16,7 @@ from ctypes import wintypes
 import threading
 
 # ── 版本号（修改此处即可更新界面右上角显示） ──
-APP_VERSION = "2.3.3"
+APP_VERSION = "2.3.5"
 
 SERVICES = [
     ("WSearch",       "Windows Search"),
@@ -271,6 +271,8 @@ def eject_volume_api(letter):
         return False, "无法打开卷句柄"
 
     br = wintypes.DWORD(0)
+    # ★ 显式刷写缓存，确保所有待写数据落盘（防止用户开启了"更好的性能"写缓存策略）
+    k32.FlushFileBuffers(h)
     k32.DeviceIoControl(h, FSCTL_LOCK, None, 0, None, 0, ctypes.byref(br), None)
     k32.DeviceIoControl(h, FSCTL_DISMOUNT, None, 0, None, 0, ctypes.byref(br), None)
     ok = k32.DeviceIoControl(h, IOCTL_EJECT, None, 0, None, 0, ctypes.byref(br), None)
@@ -292,9 +294,8 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("移动硬盘清理工具 - 管理员模式")
-        # ── 宽度 +60 → 660，高度保持 540 ──
-        self.root.geometry("560x690")
-        self.root.minsize(460, 530)
+        self.root.geometry("560x650")
+        self.root.minsize(460, 550)
         self._busy = False
         self._svc_was_running = {}
         self._bus_cache = {}        # 总线类型缓存 {'G': 'USB', 'C': 'NVMe', ...}
