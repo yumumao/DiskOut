@@ -85,11 +85,13 @@ REM ── 生成 / 检测图标 ──
 echo.
 echo [2/4] 准备图标 ...
 set "ICON_OPT="
+set "ADD_DATA_OPT="
 
 REM 优先级1：用户手动放置的 diskout.ico（最高优先级）
 if exist "diskout.ico" (
     echo [OK] 检测到已有 diskout.ico，直接使用
     set "ICON_OPT=--icon=diskout.ico"
+    set "ADD_DATA_OPT=--add-data diskout.ico;."
     goto :ICON_DONE
 )
 
@@ -126,6 +128,7 @@ if errorlevel 1 (
 if exist "diskout.ico" (
     echo [OK] 图标生成成功
     set "ICON_OPT=--icon=diskout.ico"
+    set "ADD_DATA_OPT=--add-data diskout.ico;."
 ) else (
     echo [跳过] gen_icon.py 运行完毕但未生成 diskout.ico，将使用默认图标
 )
@@ -136,14 +139,15 @@ REM ── 打包 ──
 echo.
 echo [3/4] 正在打包为单文件 EXE ...
 if defined ICON_OPT (
-    echo        图标: diskout.ico
+    echo        EXE 文件图标: diskout.ico
+    echo        窗口标题栏图标: diskout.ico (已捆绑)
 ) else (
     echo        图标: 系统默认
 )
 echo        这可能需要 1~3 分钟，请耐心等待 ...
 echo.
 
-%PYTHON_CMD% -m PyInstaller --onefile --windowed --uac-admin --name DiskOut %ICON_OPT% --clean diskout.py
+%PYTHON_CMD% -m PyInstaller --onefile --windowed --uac-admin --name DiskOut %ICON_OPT% %ADD_DATA_OPT% --clean diskout.py
 if errorlevel 1 (
     echo.
     echo [错误] 打包失败，请查看上方错误信息
