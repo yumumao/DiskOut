@@ -1,5 +1,12 @@
 # DiskOut — 安全弹盘工具
 
+## 📥 下载 / Download
+
+👉 [**点击下载 DiskOut.exe**](https://github.com/yumumao/DiskOut/releases/latest)
+
+双击即可运行，无需安装。
+Download and double-click to run. No installation required.
+
 **DiskOut** 是一款 Windows 下的移动硬盘清理与安全弹出工具，支持 USB 硬件级安全移除（停转硬盘），
 解决 Windows 系统"该设备正在使用中"无法弹出的问题。
 
