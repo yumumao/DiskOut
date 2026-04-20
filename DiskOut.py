@@ -5,6 +5,8 @@
 自动检测并恢复脱机磁盘
 支持检测文件/文件夹占用进程和服务并一键结束
 支持普通模式运行，需要时提示提升管理员权限
+提权后自动恢复上次操作状态（含检测结果）
+管理员模式下自动放行 UIPI 拖放限制
 """
 import ctypes
 import sys
@@ -12,6 +14,7 @@ import os
 import subprocess
 import string
 import time
+import json
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from ctypes import wintypes
@@ -25,7 +28,7 @@ except ImportError:
     HAS_WINDND = False
 
 # ── 版本号（修改此处即可更新界面右上角显示） ──
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.3.1"    # ★ 修改：版本号更新
 
 SERVICES = [
     ("WSearch",       "Windows Search"),
@@ -55,6 +58,12 @@ DRIVE_TYPE_MAP = {
 }
 
 USB_BUS_TYPES = {"USB", "USB3"}
+
+# ── 提权状态文件路径 ──
+STATE_FILE_PATH = os.path.join(
+    os.environ.get("TEMP", os.path.dirname(os.path.abspath(sys.argv[0]))),
+    "_diskout_elevation_state.json"
+)
 
 USB_EJECT_PS1 = r'''
 param([int]$DiskNumber)
@@ -118,6 +127,14 @@ public class CfgMgr32 {
 '''
 
 
+# ★ 资源路径兼容函数（PyInstaller --onefile 打包后资源解压到 sys._MEIPASS）
+def resource_path(relative_path):
+    """获取资源文件的绝对路径，兼容 PyInstaller 打包和开发环境"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), relative_path)
+
+
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
@@ -171,9 +188,13 @@ def get_drives_fast(min_letter='G'):
     return drives
 
 
+# ════════════════════════════════════════════════════════════════
+#  PowerShell 查询总线类型（保留作为 fallback）
+# ════════════════════════════════════════════════════════════════
+
 def get_drive_bus_types():
     cmd = (
-        'powershell -Command "'
+        'powershell -NoProfile -Command "'
         "Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object { "
         "try { $dk = $_ | Get-Disk -ErrorAction Stop; "
         "Write-Output ('{0}|{1}' -f $_.DriveLetter, $dk.BusType) "
@@ -193,7 +214,7 @@ def get_drive_bus_types():
 def get_drive_bus_type(letter):
     letter = letter.rstrip(":\\").upper()
     cmd = (
-        f'powershell -Command "'
+        f'powershell -NoProfile -Command "'
         f"try {{ $p = Get-Partition -DriveLetter {letter} -ErrorAction Stop; "
         f"($p | Get-Disk).BusType }} catch {{ Write-Output 'Unknown' }}"
         f'"'
@@ -203,6 +224,130 @@ def get_drive_bus_type(letter):
         return out.strip()
     return "Unknown"
 
+
+# ════════════════════════════════════════════════════════════════
+#  IOCTL 快速磁盘信息查询（纯 ctypes，无需 subprocess，毫秒级）
+# ════════════════════════════════════════════════════════════════
+
+_IOCTL_STORAGE_QUERY_PROPERTY    = 0x002D1400
+_IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
+
+_BUS_TYPE_NAMES = {
+    0: "Unknown", 1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394",
+    5: "SSA", 6: "Fibre", 7: "USB", 8: "RAID", 9: "iSCSI",
+    10: "SAS", 11: "SATA", 12: "SD", 13: "MMC", 14: "Virtual",
+    15: "FileBackedVirtual", 16: "Spaces", 17: "NVMe", 18: "SCM", 19: "UFS",
+}
+
+
+class _STORAGE_PROPERTY_QUERY(ctypes.Structure):
+    _fields_ = [
+        ("PropertyId", ctypes.c_ulong),
+        ("QueryType",  ctypes.c_ulong),
+        ("Extra",      ctypes.c_byte * 1),
+    ]
+
+
+class _STORAGE_DEVICE_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Version",               ctypes.c_ulong),
+        ("Size",                  ctypes.c_ulong),
+        ("DeviceType",            ctypes.c_ubyte),
+        ("DeviceTypeModifier",    ctypes.c_ubyte),
+        ("RemovableMedia",        ctypes.c_ubyte),
+        ("CommandQueueing",       ctypes.c_ubyte),
+        ("VendorIdOffset",        ctypes.c_ulong),
+        ("ProductIdOffset",       ctypes.c_ulong),
+        ("ProductRevisionOffset", ctypes.c_ulong),
+        ("SerialNumberOffset",    ctypes.c_ulong),
+        ("BusType",               ctypes.c_ulong),
+    ]
+
+
+class _STORAGE_DEVICE_NUMBER(ctypes.Structure):
+    _fields_ = [
+        ("DeviceType",      ctypes.c_ulong),
+        ("DeviceNumber",    ctypes.c_ulong),
+        ("PartitionNumber", ctypes.c_ulong),
+    ]
+
+
+def _open_volume_handle(letter):
+    letter = letter.rstrip(":\\").upper()
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    INVALID = ctypes.c_void_p(-1).value
+    h = k32.CreateFileW(f"\\\\.\\{letter}:", 0, 0x3, None, 3, 0, None)
+    if h is None or h == INVALID:
+        return None
+    return h
+
+
+def get_bus_type_ioctl(letter):
+    h = _open_volume_handle(letter)
+    if h is None:
+        return "Unknown"
+    k32 = ctypes.windll.kernel32
+    try:
+        query = _STORAGE_PROPERTY_QUERY()
+        query.PropertyId = 0
+        query.QueryType  = 0
+
+        buf = (ctypes.c_byte * 1024)()
+        returned = wintypes.DWORD(0)
+
+        ok = k32.DeviceIoControl(
+            ctypes.c_void_p(h), _IOCTL_STORAGE_QUERY_PROPERTY,
+            ctypes.byref(query), ctypes.sizeof(query),
+            ctypes.byref(buf), 1024,
+            ctypes.byref(returned), None,
+        )
+        if ok and returned.value >= ctypes.sizeof(_STORAGE_DEVICE_DESCRIPTOR):
+            desc = _STORAGE_DEVICE_DESCRIPTOR.from_buffer(buf)
+            return _BUS_TYPE_NAMES.get(desc.BusType, f"Type{desc.BusType}")
+        return "Unknown"
+    except Exception:
+        return "Unknown"
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def get_disk_number_ioctl(letter):
+    h = _open_volume_handle(letter)
+    if h is None:
+        return None
+    k32 = ctypes.windll.kernel32
+    try:
+        sdn = _STORAGE_DEVICE_NUMBER()
+        returned = wintypes.DWORD(0)
+
+        ok = k32.DeviceIoControl(
+            ctypes.c_void_p(h), _IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            None, 0,
+            ctypes.byref(sdn), ctypes.sizeof(sdn),
+            ctypes.byref(returned), None,
+        )
+        return sdn.DeviceNumber if ok else None
+    except Exception:
+        return None
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def get_all_bus_types_ioctl(min_letter='G'):
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    result = {}
+    for i, ch in enumerate(string.ascii_uppercase):
+        if ch < min_letter:
+            continue
+        if bitmask & (1 << i):
+            result[ch] = get_bus_type_ioctl(ch)
+    return result
+
+
+# ════════════════════════════════════════════════════════════════
+#  组合检测函数
+# ════════════════════════════════════════════════════════════════
 
 def get_drives_full(min_letter='G'):
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
@@ -216,7 +361,11 @@ def get_drives_full(min_letter='G'):
     if not candidates:
         return [], {}
 
-    bus_types = get_drive_bus_types()
+    bus_types = get_all_bus_types_ioctl(min_letter)
+    all_unknown = all(v == "Unknown" for v in bus_types.values())
+    if all_unknown and candidates:
+        bus_types = get_drive_bus_types()
+
     drives = []
     for ch, dt in candidates:
         bus = bus_types.get(ch, "").upper()
@@ -232,7 +381,7 @@ def get_drives_full(min_letter='G'):
 
 def get_offline_disks():
     cmd = (
-        'powershell -Command "'
+        'powershell -NoProfile -Command "'
         "Get-Disk | Where-Object { $_.OperationalStatus -eq 'Offline' } | "
         "Select-Object Number, FriendlyName, Size, BusType | "
         'ConvertTo-Csv -NoTypeInformation"'
@@ -261,7 +410,7 @@ def get_offline_disks():
 
 def set_disk_online(disk_number):
     cmd = (
-        f'powershell -Command "'
+        f'powershell -NoProfile -Command "'
         f'Set-Disk -Number {disk_number} -IsOffline $false"'
     )
     rc, _, _ = run_cmd(cmd, timeout=15)
@@ -269,8 +418,6 @@ def set_disk_online(disk_number):
 
 
 def eject_volume_api(letter):
-    """通过 DeviceIoControl API 弹出卷：Flush → Lock → Dismount → Eject
-    返回 (成功bool, 消息str, 警告列表list)"""
     letter = letter.rstrip(":\\")
     volume = f"\\\\.\\{letter}:"
     k32 = ctypes.windll.kernel32
@@ -433,6 +580,63 @@ def collect_files_in_dir(path, max_files=300, max_depth=3):
 
 
 # ════════════════════════════════════════════════════════════════
+#  SHFileOperation — 删除到回收站
+# ════════════════════════════════════════════════════════════════
+
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd",                  ctypes.c_void_p),
+        ("wFunc",                 ctypes.c_uint),
+        ("pFrom",                 ctypes.c_wchar_p),
+        ("pTo",                   ctypes.c_wchar_p),
+        ("fFlags",                ctypes.c_ushort),
+        ("fAnyOperationsAborted", ctypes.c_int),
+        ("hNameMappings",         ctypes.c_void_p),
+        ("lpszProgressTitle",     ctypes.c_wchar_p),
+    ]
+
+
+def send_to_recycle_bin(path):
+    FO_DELETE          = 0x0003
+    FOF_ALLOWUNDO      = 0x0040
+    FOF_NOCONFIRMATION = 0x0010
+
+    op = _SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = path + '\0'
+    op.pTo = None
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION
+    op.fAnyOperationsAborted = 0
+    op.hNameMappings = None
+    op.lpszProgressTitle = None
+
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    return result == 0 and not op.fAnyOperationsAborted
+
+
+# ════════════════════════════════════════════════════════════════
+#  进程是否存活检查
+# ════════════════════════════════════════════════════════════════
+
+def is_process_alive(pid):
+    """检查 PID 是否仍然存活"""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if k32.GetExitCodeProcess(h, ctypes.byref(exit_code)):
+            return exit_code.value == STILL_ACTIVE
+        return False
+    finally:
+        k32.CloseHandle(h)
+
+
+# ════════════════════════════════════════════════════════════════
 
 REC_BG       = "#dae8fc"
 REC_FG       = "#1a3a6b"
@@ -449,8 +653,8 @@ class App:
         self.root = tk.Tk()
         title_mode = "管理员模式" if self._is_admin else "普通模式"
         self.root.title(f"移动硬盘弹出工具 - {title_mode}")
-        self.root.geometry("560x690")
-        self.root.minsize(460, 550)
+        self.root.geometry("560x720")
+        self.root.minsize(460, 560)
         self._set_icon(self.root)
         self._busy = False
         self._all_stopped_services = {}
@@ -458,20 +662,22 @@ class App:
         self._detecting = False
         self._file_lock_processes = []
         self._file_lock_services = {}
+        self._file_lock_path = ""
+        self._detection_is_restored = False   # ★ 标记检测结果来自提权前
+        self._dnd_ok = False                  # ★ 新增：标记拖放是否成功初始化
         self.build_ui()
+        self._restore_state_from_elevation()
         self.root.after(100, self._start_bus_detection)
         self.root.after(500, self._check_offline_on_start)
         self.root.mainloop()
 
-    # ── 设置窗口图标 ──
     def _set_icon(self, window):
         try:
-            ico_path = os.path.join(
-                os.path.dirname(os.path.abspath(sys.argv[0])),
-                "DiskOut.ico"
-            )
-            if os.path.isfile(ico_path):
-                window.iconbitmap(ico_path)
+            for ico_name in ("diskout.ico", "DiskOut.ico", "Diskout.ico"):
+                ico_path = resource_path(ico_name)
+                if os.path.isfile(ico_path):
+                    window.iconbitmap(ico_path)
+                    return
         except Exception:
             pass
 
@@ -480,20 +686,253 @@ class App:
     # ════════════════════════════════════════════════════════════
 
     def _require_admin(self, operation="此操作"):
-        """检查管理员权限。已是管理员返回 True；否则提示用户并返回 False。"""
         if self._is_admin:
             return True
         msg = (
             f"「{operation}」需要管理员权限。\n\n"
             f"是否以管理员身份重新启动程序？\n"
-            f"（当前窗口将关闭）"
+            f"（当前窗口将关闭，操作状态将自动恢复）"
         )
         if messagebox.askyesno("需要管理员权限", msg, icon="warning"):
             self._restart_as_admin()
         return False
 
+    def _save_state_for_elevation(self):
+        """保存当前 UI 状态和检测结果到临时文件，供提权后恢复"""
+        try:
+            tab_idx = 0
+            try:
+                tab_idx = self.notebook.index(self.notebook.select())
+            except Exception:
+                pass
+            state = {
+                "file_path": self.file_path_var.get(),
+                "drive": self.drive_var.get(),
+                "tab": tab_idx,
+                "show_def": self.show_def_var.get(),
+                "timestamp": time.time(),
+                # ★ 保存检测结果
+                "file_lock_path": self._file_lock_path,
+                "file_lock_processes": self._file_lock_processes,
+                "file_lock_services": self._file_lock_services,
+            }
+            with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _restore_state_from_elevation(self):
+        """从临时文件恢复提权前的 UI 状态和检测结果"""
+        try:
+            if not os.path.exists(STATE_FILE_PATH):
+                return
+            age = time.time() - os.path.getmtime(STATE_FILE_PATH)
+            if age > 120:
+                os.remove(STATE_FILE_PATH)
+                return
+            with open(STATE_FILE_PATH, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            os.remove(STATE_FILE_PATH)
+
+            restored = []
+
+            if state.get("file_path"):
+                self.file_path_var.set(state["file_path"])
+                restored.append(f"文件路径: {state['file_path']}")
+
+            if state.get("show_def"):
+                self.show_def_var.set(True)
+                self.drive_frame.config(
+                    text="盘符选择（D: 及之后 ⚠ 含本地硬盘）")
+                restored.append("D/E/F 盘显示: 已启用")
+
+            if state.get("drive"):
+                drive_prefix = state["drive"].split()[0] if state["drive"] else ""
+                if drive_prefix:
+                    self.drive_var.set(state["drive"])
+                    restored.append(f"盘符: {drive_prefix}")
+
+            if state.get("tab") is not None:
+                try:
+                    self.notebook.select(state["tab"])
+                except Exception:
+                    pass
+                tab_names = ["解除磁盘占用/弹出", "文件/文件夹占用", "进阶功能"]
+                idx = state["tab"]
+                if 0 <= idx < len(tab_names):
+                    restored.append(f"标签页: {tab_names[idx]}")
+
+            # ★ 恢复检测结果
+            has_detection = False
+            if state.get("file_lock_path"):
+                self._file_lock_path = state["file_lock_path"]
+            if state.get("file_lock_processes"):
+                self._file_lock_processes = state["file_lock_processes"]
+                has_detection = True
+            if state.get("file_lock_services"):
+                self._file_lock_services = state["file_lock_services"]
+                has_detection = True
+
+            if restored:
+                self.log_msg("[恢复] 已从提权前恢复以下状态：")
+                for item in restored:
+                    self.log_msg(f"  • {item}")
+
+            # ★ 如有检测结果，显示恢复信息并弹出引导对话框
+            if has_detection:
+                n_proc = len(self._file_lock_processes)
+                n_svc = len(self._file_lock_services)
+                self._detection_is_restored = True
+                self.log_msg("")
+                self.log_msg(f"[恢复] 已恢复提权前的检测结果：")
+                self.log_msg(f"  检测路径: {self._file_lock_path}")
+                self.log_msg(f"  占用进程: {n_proc} 个")
+                if self._file_lock_processes:
+                    for p in self._file_lock_processes:
+                        self.log_msg(
+                            f"    PID={p['pid']:<6}  {p['name']:<24}"
+                            f"  {p.get('detail','')}")
+                self.log_msg(f"  占用服务: {n_svc} 个")
+                if self._file_lock_services:
+                    for name, display in self._file_lock_services.items():
+                        self.log_msg(f"    {display} ({name})")
+                self.log_msg("")
+
+                # ★ 验证进程是否仍存活
+                alive_procs = []
+                dead_procs = []
+                for p in self._file_lock_processes:
+                    if is_process_alive(p["pid"]):
+                        alive_procs.append(p)
+                    else:
+                        dead_procs.append(p)
+
+                if dead_procs:
+                    self.log_msg(f"[验证] 以下 {len(dead_procs)} 个进程已不存在"
+                                 f"（提权期间退出）：")
+                    for p in dead_procs:
+                        self.log_msg(f"    PID={p['pid']}  {p['name']}  →  已退出")
+                    self._file_lock_processes = alive_procs
+                    self.log_msg(f"[验证] 仍存活: {len(alive_procs)} 个进程\n")
+
+                # ★ 弹出引导对话框
+                self.root.after(
+                    400,
+                    lambda: self._show_restored_detection_dialog(
+                        len(alive_procs),
+                        len(self._file_lock_services)))
+            else:
+                self.log_msg("")
+
+        except Exception:
+            pass
+        finally:
+            try:
+                if os.path.exists(STATE_FILE_PATH):
+                    os.remove(STATE_FILE_PATH)
+            except Exception:
+                pass
+
+    def _show_restored_detection_dialog(self, n_proc, n_svc):
+        """提权后弹出引导对话框：选择重新检测 / 直接解除 / 稍后决定"""
+        if n_proc == 0 and n_svc == 0:
+            self.log_msg("[提示] 提权前的检测结果已全部失效，请重新检测。\n")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("提权完成 — 检测结果已恢复")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        self._set_icon(dlg)
+
+        ttk.Label(
+            dlg,
+            text="✓ 已成功提升为管理员权限",
+            font=("Microsoft YaHei UI", 12, "bold"),
+            foreground="#1a7f1a",
+        ).pack(padx=24, pady=(18, 6))
+
+        path_text = self._file_lock_path if self._file_lock_path else "(未知)"
+        info_text = (
+            f"提权前的检测结果已恢复：\n\n"
+            f"  检测路径：{path_text}\n"
+            f"  占用进程：{n_proc} 个（已验证仍存活）\n"
+            f"  占用服务：{n_svc} 个\n"
+        )
+        ttk.Label(
+            dlg, text=info_text,
+            font=("Microsoft YaHei UI", 10),
+            justify="left",
+        ).pack(padx=24, pady=(4, 6))
+
+        ttk.Label(
+            dlg,
+            text=(
+                "请选择下一步操作：\n\n"
+                "• 重新检测（推荐）— 确保结果最新最准确\n"
+                "• 直接解除占用 — 使用已恢复的结果立即解除\n"
+                "• 稍后决定 — 关闭对话框，自行操作"
+            ),
+            font=("Microsoft YaHei UI", 10),
+            justify="left",
+            wraplength=440,
+        ).pack(padx=24, pady=(0, 12))
+
+        btn_frame = ttk.Frame(dlg, padding=8)
+        btn_frame.pack(fill="x", padx=24, pady=(0, 18))
+
+        def do_redetect():
+            dlg.destroy()
+            self._detection_is_restored = False
+            self.detect_file_lock()
+
+        def do_kill_now():
+            dlg.destroy()
+            self._detection_is_restored = False
+            self.kill_all_file_lock()
+
+        def do_later():
+            dlg.destroy()
+
+        # ★ 推荐按钮
+        redetect_btn = ttk.Button(
+            btn_frame, text="🔍 重新检测（推荐）",
+            command=do_redetect)
+        redetect_btn.pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            btn_frame, text="⚡ 直接解除占用",
+            command=do_kill_now,
+        ).pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            btn_frame, text="稍后决定",
+            command=do_later,
+        ).pack(side="right")
+
+        dlg.protocol("WM_DELETE_WINDOW", do_later)
+
+        dlg.update_idletasks()
+        dlg_w = dlg.winfo_width()
+        dlg_h = dlg.winfo_height()
+        root_x = self.root.winfo_x()
+        root_y = self.root.winfo_y()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        x = root_x + (root_w - dlg_w) // 2
+        y = root_y + (root_h - dlg_h) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cleanup_state_file(self):
+        try:
+            if os.path.exists(STATE_FILE_PATH):
+                os.remove(STATE_FILE_PATH)
+        except Exception:
+            pass
+
     def _restart_as_admin(self):
-        """以管理员身份重新启动程序"""
+        self._save_state_for_elevation()
         try:
             if getattr(sys, 'frozen', False):
                 exe = sys.executable
@@ -510,19 +949,77 @@ class App:
                 self.root.destroy()
                 sys.exit(0)
             else:
+                self._cleanup_state_file()
                 self.log_msg("[提示] 用户取消了权限提升，或提升失败")
         except Exception as e:
+            self._cleanup_state_file()
             self.log_msg(f"[错误] 提升权限失败: {e}")
 
     def _request_admin_elevation(self):
-        """用户手动点击提升权限按钮"""
         msg = (
             "将以管理员身份重新启动程序。\n"
-            "当前窗口将关闭。\n\n"
+            "当前窗口将关闭，操作状态（含检测结果）将自动恢复。\n\n"
             "是否继续？"
         )
         if messagebox.askyesno("提升为管理员", msg):
             self._restart_as_admin()
+
+    # ════════════════════════════════════════════════════════════
+    #  ★ 新增：管理员模式下放行 UIPI 拖放消息限制
+    # ════════════════════════════════════════════════════════════
+
+    def _allow_drag_drop_admin(self):
+        """
+        管理员模式下，Windows UIPI 会阻止普通权限进程（如资源管理器）
+        向高权限窗口发送拖放消息。此方法通过 ChangeWindowMessageFilter /
+        ChangeWindowMessageFilterEx 放行相关消息，使拖放在管理员窗口中也能工作。
+        """
+        if not self._is_admin:
+            return
+
+        MSGFLT_ALLOW        = 1
+        WM_DROPFILES        = 0x0233
+        WM_COPYDATA         = 0x004A
+        WM_COPYGLOBALDATA   = 0x0049
+
+        user32 = ctypes.windll.user32
+
+        # 方法 1：全局消息过滤器（进程级，Vista+）
+        try:
+            _filter = user32.ChangeWindowMessageFilter
+            _filter.argtypes = [wintypes.UINT, wintypes.DWORD]
+            _filter.restype = wintypes.BOOL
+            _filter(WM_DROPFILES, MSGFLT_ALLOW)
+            _filter(WM_COPYDATA, MSGFLT_ALLOW)
+            _filter(WM_COPYGLOBALDATA, MSGFLT_ALLOW)
+        except Exception:
+            pass
+
+        # 方法 2：窗口级过滤器（Win7+），对 windnd 使用的 HWND 精确放行
+        try:
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+
+            _filterex = user32.ChangeWindowMessageFilterEx
+            _filterex.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.DWORD, ctypes.c_void_p
+            ]
+            _filterex.restype = wintypes.BOOL
+            _filterex(hwnd, WM_DROPFILES, MSGFLT_ALLOW, None)
+            _filterex(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None)
+            _filterex(hwnd, WM_COPYGLOBALDATA, MSGFLT_ALLOW, None)
+
+            # 同时对顶层窗口 HWND 放行（tkinter 内部 HWND 与顶层可能不同）
+            try:
+                top_hwnd = int(self.root.frame(), 16)
+                if top_hwnd != hwnd:
+                    _filterex(top_hwnd, WM_DROPFILES, MSGFLT_ALLOW, None)
+                    _filterex(top_hwnd, WM_COPYDATA, MSGFLT_ALLOW, None)
+                    _filterex(top_hwnd, WM_COPYGLOBALDATA, MSGFLT_ALLOW, None)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ════════════════════════════════════════════════════════════
 
@@ -599,14 +1096,14 @@ class App:
         m = ttk.Frame(self.root, padding=8)
         m.pack(fill="both", expand=True)
 
-        # ── 顶部栏：版本号 + 权限状态 ──
+        # ── 顶部栏 ──
         top_row = ttk.Frame(m)
         top_row.pack(fill="x", pady=(0, 2))
 
         ver_lbl = ttk.Label(
             top_row, text=f"v{APP_VERSION}",
             foreground="#909090",
-            font=("Consolas", 9),
+            font=("Consolas", 10),
         )
         ver_lbl.pack(side="left")
 
@@ -669,14 +1166,12 @@ class App:
             command=self._toggle_def,
         ).pack(side="left")
 
-        # ── Notebook（功能区） ──
+        # ── Notebook ──
         nb = ttk.Notebook(m)
         self.notebook = nb
         gk = dict(sticky="nsew", padx=3, pady=3, ipady=2)
 
-        # ══════════════════════════════════════════════════════════
-        #  Tab 1: 解除磁盘占用 / 弹出
-        # ══════════════════════════════════════════════════════════
+        # ══════════ Tab 1: 解除磁盘占用 / 弹出 ══════════
         t1 = ttk.Frame(nb, padding=6)
         nb.add(t1, text=" 解除磁盘占用 / 弹出 ")
         t1.columnconfigure(0, weight=1)
@@ -699,9 +1194,7 @@ class App:
         ttk.Button(t1, text="强制弹出\n直接弹出硬盘",
                    command=self.force_eject).grid(row=3, column=1, **gk)
 
-        # ══════════════════════════════════════════════════════════
-        #  Tab 2: 文件/文件夹占用检测（原 Tab 3）
-        # ══════════════════════════════════════════════════════════
+        # ══════════ Tab 2: 文件/文件夹占用检测 ══════════
         t2 = ttk.Frame(nb, padding=6)
         nb.add(t2, text=" 文件/文件夹占用 ")
 
@@ -742,23 +1235,30 @@ class App:
                 auto_popup=False),
         ).grid(row=0, column=2, sticky="ew", padx=3, pady=2)
 
+        # ★ 修改：拖放提示区分管理员 / 普通模式
         if HAS_WINDND:
-            dnd_hint = "✓ 拖放已启用 — 可将文件或文件夹直接拖入窗口"
+            try:
+                self._allow_drag_drop_admin()           # ★ 新增：先放行 UIPI
+                windnd.hook_dropfiles(self.root, func=self._on_file_drop)
+                self._dnd_ok = True
+            except Exception:
+                self._dnd_ok = False
+
+            if self._dnd_ok and self._is_admin:
+                dnd_hint = ("✓ 拖放已启用（管理员模式，已自动放行 UIPI；"
+                            "如拖放仍失效请用浏览按钮）")
+            elif self._dnd_ok:
+                dnd_hint = "✓ 拖放已启用 — 可将文件或文件夹直接拖入窗口"
+            else:
+                dnd_hint = "⚠ 拖放初始化失败，请使用浏览按钮选择路径"
         else:
             dnd_hint = ("提示：安装 windnd（pip install windnd）可启用"
                         "拖放功能，也可手动粘贴路径")
+
         ttk.Label(t2, foreground="gray", text=dnd_hint,
                   wraplength=600).pack(anchor="w", pady=(2, 0))
 
-        if HAS_WINDND:
-            try:
-                windnd.hook_dropfiles(self.root, func=self._on_file_drop)
-            except Exception:
-                pass
-
-        # ══════════════════════════════════════════════════════════
-        #  Tab 3: 进阶功能（原 Tab 2）
-        # ══════════════════════════════════════════════════════════
+        # ══════════ Tab 3: 进阶功能 ══════════
         t3 = ttk.Frame(nb, padding=6)
         nb.add(t3, text=" 进阶功能 ")
 
@@ -790,14 +1290,12 @@ class App:
                  "\n如需恢复，请在拔盘前点击【恢复】按钮。"
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        # ── 保存 Tab 引用用于动态测高 ──
         self._tab_frames = [t1, t2, t3]
 
-        # ── Notebook 放入主区域，只占所需高度 ──
         nb.pack(fill="x", pady=(4, 0))
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        # ── 日志区域，占据所有剩余空间 ──
+        # ── 日志区域 ──
         f4 = ttk.LabelFrame(m, text="执行日志", padding=4)
         f4.pack(fill="both", expand=True, pady=(4, 0))
 
@@ -813,10 +1311,8 @@ class App:
         )
         self.log.pack(fill="both", expand=True)
 
-        # ── 初始调整 Notebook 高度 ──
         self.root.after(150, self._resize_notebook_to_current)
 
-        # ── 启动日志 ──
         mode_text = "管理员模式" if self._is_admin else "普通模式"
         self.log_msg(f"[OK] 工具已启动（{mode_text}）")
         if not self._is_admin:
@@ -825,14 +1321,25 @@ class App:
         ds = ", ".join(f"{d[0]}[{d[1]}]" for d in drives) if drives else "无"
         self.log_msg(f"检测到盘符：{ds}")
         self.log_msg("正在后台识别磁盘总线类型...")
+
+        # ★ 修改：拖放启动日志区分管理员模式
         if HAS_WINDND:
-            self.log_msg("[拖放] windnd 已加载，支持拖放文件/文件夹到窗口")
+            if self._dnd_ok:
+                self.log_msg("[拖放] windnd 已加载，支持拖放文件/文件夹到窗口")
+                if self._is_admin:
+                    self.log_msg("[拖放] 管理员模式：已放行 UIPI 拖放消息"
+                                 "（WM_DROPFILES / WM_COPYGLOBALDATA）")
+                    self.log_msg("[拖放] 如拖放仍不可用，"
+                                 "请使用「文件」或「文件夹」浏览按钮")
+            else:
+                self.log_msg("[拖放] windnd 已安装但初始化失败，请使用浏览按钮")
         else:
             self.log_msg("[拖放] 未安装 windnd，可用 pip install windnd 启用拖放")
+
         self.log_msg("")
 
     # ════════════════════════════════════════════════════════════
-    #  Notebook 动态高度：切换 Tab 时自动调整
+    #  Notebook 动态高度
     # ════════════════════════════════════════════════════════════
 
     def _on_tab_changed(self, event=None):
@@ -862,7 +1369,6 @@ class App:
                 messagebox.showinfo("提示", "没有需要恢复的服务。")
             return
 
-        # 手动调用时检查管理员权限（恢复服务需要 net start）
         if not auto_popup and not self._is_admin:
             if not self._require_admin("恢复服务"):
                 return
@@ -1014,13 +1520,13 @@ class App:
         else:
             self._on_drive_selected()
 
-    # ========== 获取总线类型（带缓存） ==========
-
     def _get_bus_type(self, letter):
         letter = letter.rstrip(":\\").upper()
         if letter in self._bus_cache:
             return self._bus_cache[letter]
-        bus = get_drive_bus_type(letter)
+        bus = get_bus_type_ioctl(letter)
+        if bus == "Unknown":
+            bus = get_drive_bus_type(letter)
         self._bus_cache[letter] = bus
         return bus
 
@@ -1256,8 +1762,11 @@ class App:
     # ========== USB 安全移除 ==========
 
     def _get_disk_number(self, letter):
+        num = get_disk_number_ioctl(letter)
+        if num is not None:
+            return num
         rc, out, _ = run_cmd(
-            f'powershell -Command "'
+            f'powershell -NoProfile -Command "'
             f"(Get-Partition -DriveLetter {letter} -ErrorAction Stop).DiskNumber"
             f'"', timeout=10
         )
@@ -1271,7 +1780,7 @@ class App:
             with open(ps_file, "w", encoding="utf-8-sig") as f:
                 f.write(USB_EJECT_PS1)
             cmd = (
-                f'powershell -ExecutionPolicy Bypass '
+                f'powershell -NoProfile -ExecutionPolicy Bypass '
                 f'-File "{ps_file}" -DiskNumber {disk_number}'
             )
             rc, out, err = run_cmd(cmd, timeout=20)
@@ -1291,10 +1800,7 @@ class App:
             except OSError:
                 pass
 
-    # ========== 卷缓冲区刷新 ==========
-
     def _flush_volume(self, d):
-        """对卷做一次显式 FlushFileBuffers，确保写缓冲区落盘"""
         letter = d.rstrip(":\\")
         volume = f"\\\\.\\{letter}:"
         k32 = ctypes.windll.kernel32
@@ -1328,7 +1834,6 @@ class App:
         else:
             self.log_msg("    [!] 无法获取磁盘号，USB 安全移除可能不可用")
 
-        # ── 方法1: USB 安全移除 (CM_Request_Device_Eject) ──
         if disk_number is not None:
             self.log_msg("\n  方法1: USB 安全移除 (CM_Request_Device_Eject) ...")
             usb_ok = self._usb_safe_remove(disk_number)
@@ -1341,7 +1846,6 @@ class App:
             else:
                 self.log_msg("    失败（可能有程序占用），尝试下一方法...")
 
-        # ── 方法2: DeviceIoControl API (Flush→Lock→Dismount→Eject) ──
         self.log_msg("\n  方法2: DeviceIoControl API ...")
         ok, msg, warnings = eject_volume_api(d)
         if warnings:
@@ -1357,10 +1861,9 @@ class App:
             return True
         self.log_msg("    盘符仍在，尝试下一方法...")
 
-        # ── 方法3: Shell.Application Eject ──
         self.log_msg("\n  方法3: Shell.Application Eject ...")
         cmd = (
-            'powershell -Command "'
+            'powershell -NoProfile -Command "'
             "(New-Object -ComObject Shell.Application)"
             ".NameSpace(17).ParseName('"
             + letter
@@ -1377,14 +1880,13 @@ class App:
             return True
         self.log_msg("    盘符仍在，尝试下一方法...")
 
-        # ── 方法4: Set-Disk -IsOffline + USB 安全移除（需管理员） ──
         if self._is_admin:
             self.log_msg("\n  方法4: Set-Disk -IsOffline + USB 安全移除 ...")
             self.log_msg("    [注意] 此方法如果 USB 移除失败，下次插入可能需要手动恢复联机")
             self.log_msg("    刷新卷缓冲区...")
             self._flush_volume(d)
             cmd = (
-                'powershell -Command "'
+                'powershell -NoProfile -Command "'
                 "$p = Get-Partition -DriveLetter "
                 + letter
                 + " -ErrorAction Stop; "
@@ -1410,7 +1912,6 @@ class App:
         else:
             self.log_msg("\n  方法4: 跳过（需要管理员权限）")
 
-        # ── 方法5: diskpart（需管理员） ──
         if self._is_admin:
             self.log_msg("\n  方法5: diskpart ...")
             self.log_msg("    刷新卷缓冲区...")
@@ -1458,7 +1959,7 @@ class App:
 
         self.log_msg("\n[1] 在该盘上运行的进程：")
         cmd = (
-            'powershell -Command "'
+            'powershell -NoProfile -Command "'
             "Get-Process | Where-Object { $_.Path -like '"
             + d
             + "\\*' } | "
@@ -1470,7 +1971,7 @@ class App:
 
         self.log_msg("\n[2] 加载了该盘文件的进程：")
         ps = (
-            'powershell -Command "Get-Process | ForEach-Object { $p=$_; try { '
+            'powershell -NoProfile -Command "Get-Process | ForEach-Object { $p=$_; try { '
             "$p.Modules | Where-Object { $_.FileName -like '"
             + d
             + "\\*' } | "
@@ -1596,6 +2097,11 @@ class App:
                 self._all_stopped_services.pop(name, None)
         self.log_msg("[OK] 服务恢复完成\n")
 
+        if ok:
+            self.log_msg("正在刷新盘符列表...")
+            time.sleep(1)
+            self.root.after(0, self.refresh)
+
     def force_eject(self):
         d = self.get_drive()
         if not d:
@@ -1623,6 +2129,9 @@ class App:
         ok = self._try_eject(d)
         if ok:
             self.log_msg(f"\n[OK] {d} 已弹出！可以安全拔出硬盘。\n")
+            self.log_msg("正在刷新盘符列表...")
+            time.sleep(1)
+            self.root.after(0, self.refresh)
         else:
             self.log_msg(f"\n[!!] {d} 仍然存在，弹出失败。")
             if not self._is_admin:
@@ -1781,10 +2290,12 @@ class App:
         if not os.path.exists(path):
             messagebox.showwarning("提示", f"路径不存在:\n{path}")
             return
+        self._detection_is_restored = False
         self.run_in_thread(lambda: self._do_detect_file_lock(path))
 
     def _do_detect_file_lock(self, path):
         is_dir = os.path.isdir(path)
+        self._file_lock_path = path
         self.log_msg(f"\n{'='*50}")
         self.log_msg(f"  检测占用: {path}")
         self.log_msg(f"  类型: {'文件夹' if is_dir else '文件'}")
@@ -1792,6 +2303,9 @@ class App:
 
         all_procs = {}
 
+        # ══════════════════════════════════════════════════════
+        # [1] Restart Manager API 检测
+        # ══════════════════════════════════════════════════════
         self.log_msg("\n[1] Restart Manager API 检测:")
         if is_dir:
             self.log_msg("    收集目录内文件（最多300个，深度3层）...")
@@ -1803,7 +2317,8 @@ class App:
                     rm_results = find_locking_processes_rm(batch)
                     for r in rm_results:
                         if r["pid"] not in all_procs:
-                            svc = f" (服务: {r['service']})" if r["service"] else ""
+                            svc = (f" (服务: {r['service']})"
+                                   if r["service"] else "")
                             all_procs[r["pid"]] = {
                                 "pid": r["pid"],
                                 "name": r["name"],
@@ -1812,7 +2327,8 @@ class App:
         else:
             rm_results = find_locking_processes_rm(path)
             for r in rm_results:
-                svc = f" (服务: {r['service']})" if r["service"] else ""
+                svc = (f" (服务: {r['service']})"
+                       if r["service"] else "")
                 all_procs[r["pid"]] = {
                     "pid": r["pid"],
                     "name": r["name"],
@@ -1828,11 +2344,14 @@ class App:
         else:
             self.log_msg("    （未检测到）")
 
+        # ══════════════════════════════════════════════════════
+        # [2] 进程路径 / 模块匹配检测
+        # ══════════════════════════════════════════════════════
         if is_dir:
             self.log_msg("\n[2] PowerShell 进程路径/模块检测:")
             escaped = path.replace("'", "''").rstrip('\\')
             ps_cmd = (
-                'powershell -Command "Get-Process | ForEach-Object { '
+                'powershell -NoProfile -Command "Get-Process | ForEach-Object { '
                 '$p=$_; $found=$false; '
                 "if ($p.Path -and ($p.Path -like '"
                 + escaped
@@ -1871,7 +2390,59 @@ class App:
                             pass
             if not ps_found:
                 self.log_msg("    （未检测到）")
+        else:
+            self.log_msg("\n[2] 进程可执行文件/模块匹配检测:")
+            escaped = path.replace("'", "''")
+            ps_cmd = (
+                'powershell -NoProfile -Command "Get-Process | ForEach-Object { '
+                "$p=$_; $tag=$null; "
+                "if ($p.Path -and ($p.Path -eq '"
+                + escaped
+                + "')) { $tag='EXE' }; "
+                "if (-not $tag) { try { "
+                "$p.Modules | ForEach-Object { "
+                "if ($_.FileName -eq '"
+                + escaped
+                + "') { $tag='MOD' } } "
+                "} catch {} }; "
+                "if ($tag) { "
+                "Write-Output ('{0}|{1}|{2}|{3}' -f "
+                "$tag,$p.Id,$p.Name,$p.Path) "
+                '} }"'
+            )
+            rc, out, _ = run_cmd(ps_cmd, timeout=20)
+            ps_found = 0
+            if rc == 0 and out.strip():
+                for line in out.strip().splitlines():
+                    parts = line.strip().split('|', 3)
+                    if len(parts) >= 3:
+                        try:
+                            tag = parts[0]
+                            pid = int(parts[1])
+                            pname = parts[2]
+                            ppath = parts[3] if len(parts) > 3 else ""
+                            ps_found += 1
+                            if tag == "EXE":
+                                detail = "★ 该文件正在作为进程运行"
+                            else:
+                                detail = "该文件被加载为模块"
+                            self.log_msg(
+                                f"    PID={pid:<6}  {pname:<24}  {detail}"
+                            )
+                            if pid not in all_procs:
+                                all_procs[pid] = {
+                                    "pid": pid,
+                                    "name": pname,
+                                    "detail": detail,
+                                }
+                        except ValueError:
+                            pass
+            if not ps_found:
+                self.log_msg("    （未检测到进程匹配）")
 
+        # ══════════════════════════════════════════════════════
+        # [3] 常见占用服务状态
+        # ══════════════════════════════════════════════════════
         drive_letter = self._drive_letter_of(path)
         self.log_msg("\n[3] 常见占用服务状态：")
         if drive_letter:
@@ -1887,6 +2458,9 @@ class App:
             else:
                 self.log_msg(f"    - {display} ({name})  ->  未安装")
 
+        # ══════════════════════════════════════════════════════
+        # [4] openfiles 查询
+        # ══════════════════════════════════════════════════════
         if drive_letter:
             self.log_msg(f"\n[4] openfiles 查询 ({drive_letter}:):")
             rc, out, err = run_cmd("openfiles /query /fo csv", timeout=10)
@@ -1909,18 +2483,22 @@ class App:
 
         self._file_lock_processes = list(all_procs.values())
 
-        total_issues = len(self._file_lock_processes) + len(self._file_lock_services)
+        total_issues = (len(self._file_lock_processes)
+                        + len(self._file_lock_services))
         if total_issues > 0:
-            self.log_msg(f"\n[结果] 检测到 {len(self._file_lock_processes)} 个占用进程"
-                         f"，{len(self._file_lock_services)} 个运行中的占用服务")
-            self.log_msg("  → 点击【一键停止所有占用】可停止服务 + 结束进程")
+            self.log_msg(
+                f"\n[结果] 检测到 {len(self._file_lock_processes)} 个占用进程"
+                f"，{len(self._file_lock_services)} 个运行中的占用服务")
+            self.log_msg(
+                "  → 点击【一键停止所有占用】可停止服务 + 结束进程")
             self.log_msg("  → 事后可点击【恢复已停止的服务】恢复\n")
         else:
             self.log_msg("\n[结果] 未检测到占用进程和运行中的占用服务")
             self.log_msg("  可能原因：")
             self.log_msg("  • 系统内核/驱动级占用（如杀毒软件实时防护）")
             self.log_msg("  • 句柄已关闭但 Windows 仍缓存引用（稍后重试）")
-            self.log_msg("  • 深层子目录中的文件被占用（当前最多扫描3层）\n")
+            self.log_msg(
+                "  • 深层子目录中的文件被占用（当前最多扫描3层）\n")
 
     def kill_all_file_lock(self):
         has_proc = bool(self._file_lock_processes)
@@ -1933,11 +2511,40 @@ class App:
             )
             return
 
-        # 如果涉及停止服务，需要管理员权限
+        # ★ 如果检测结果来自提权前，先验证并提示
+        if self._detection_is_restored:
+            alive = [p for p in self._file_lock_processes
+                     if is_process_alive(p["pid"])]
+            dead_count = len(self._file_lock_processes) - len(alive)
+            self._file_lock_processes = alive
+            has_proc = bool(alive)
+
+            # 重新检查服务状态
+            still_running = {}
+            for name, display in self._file_lock_services.items():
+                if svc_status(name) == "running":
+                    still_running[name] = display
+            self._file_lock_services = still_running
+            has_svc = bool(still_running)
+
+            if not has_proc and not has_svc:
+                messagebox.showinfo(
+                    "提示",
+                    "提权前检测到的占用已全部失效（进程已退出、服务已停止）。\n\n"
+                    "如仍有问题，请重新点击【检测占用】。"
+                )
+                self._detection_is_restored = False
+                return
+
         if has_svc and not self._require_admin("停止占用服务并结束进程"):
             return
 
         lines = []
+
+        # ★ 如果是恢复的结果，给出明确提示
+        if self._detection_is_restored:
+            lines.append("⚠ 以下为提权前的检测结果（已验证仍有效）：\n")
+
         if has_svc:
             lines.append(f"将停止 {len(self._file_lock_services)} 个服务：")
             for name, display in self._file_lock_services.items():
@@ -1957,6 +2564,8 @@ class App:
         msg = "\n".join(lines)
         if not messagebox.askyesno("确认停止所有占用", msg, icon="warning"):
             return
+
+        self._detection_is_restored = False
         self.run_in_thread(self._do_kill_all_file_lock)
 
     def _do_kill_all_file_lock(self):
@@ -1995,20 +2604,27 @@ class App:
             for proc in self._file_lock_processes:
                 pid = proc["pid"]
                 name = proc["name"]
+                if not is_process_alive(pid):
+                    self.log_msg(f"  跳过 PID={pid} ({name}) — 已不存在")
+                    continue
                 self.log_msg(f"  结束 PID={pid} ({name}) ...")
                 rc, _, err = run_cmd(f"taskkill /F /PID {pid}", timeout=10)
                 if rc == 0:
                     self.log_msg(f"    [OK] 已结束")
                     killed += 1
                 else:
-                    err_s = err.strip().split('\n')[0] if err.strip() else "未知错误"
+                    err_s = (err.strip().split('\n')[0]
+                             if err.strip() else "未知错误")
                     self.log_msg(f"    [!] 失败: {err_s}")
                     failed += 1
             self.log_msg(f"  成功结束 {killed} 个进程")
             if failed:
-                self.log_msg(f"  {failed} 个进程无法结束（可能是系统关键进程或已退出）")
+                self.log_msg(
+                    f"  {failed} 个进程无法结束"
+                    f"（可能是系统关键进程或已退出）")
                 if not self._is_admin:
-                    self.log_msg("  [提示] 以管理员身份运行可结束更多进程")
+                    self.log_msg(
+                        "  [提示] 以管理员身份运行可结束更多进程")
         else:
             self.log_msg("\n步骤 2：无需结束的进程")
 
@@ -2018,9 +2634,51 @@ class App:
         self.log_msg(f"\n[OK] 操作完成：停止 {svc_stopped} 个服务"
                      f"，结束 {killed} 个进程\n")
 
-        if stopped_now:
+        # ★ 解除占用后询问是否删除
+        saved_path = self._file_lock_path
+        if saved_path and os.path.exists(saved_path):
             self.root.after(
-                0, lambda: self._show_service_restore_dialog(auto_popup=True))
+                300,
+                lambda p=saved_path: self._prompt_delete_after_unlock(p))
+        elif self._all_stopped_services:
+            self.root.after(
+                0,
+                lambda: self._show_service_restore_dialog(auto_popup=True))
+
+    # ════════════════════════════════════════════════════════════
+    #  解除占用后删除到回收站
+    # ════════════════════════════════════════════════════════════
+
+    def _prompt_delete_after_unlock(self, path):
+        if not os.path.exists(path):
+            self.log_msg(f"[信息] 路径已不存在（可能随进程退出已删除）: {path}")
+            if self._all_stopped_services:
+                self._show_service_restore_dialog(auto_popup=True)
+            return
+
+        is_dir = os.path.isdir(path)
+        type_str = "文件夹" if is_dir else "文件"
+        msg = (
+            f"占用已解除。\n\n"
+            f"是否将该{type_str}移到回收站？\n\n"
+            f"路径: {path}\n\n"
+            f"• 【是】→ 删除到回收站（可从回收站恢复）\n"
+            f"• 【否】→ 保留不删除"
+        )
+        do_delete = messagebox.askyesno("删除确认", msg)
+
+        if do_delete:
+            self.log_msg(f"\n--- 删除到回收站 ---")
+            self.log_msg(f"  路径: {path}")
+            ok = send_to_recycle_bin(path)
+            if ok and not os.path.exists(path):
+                self.log_msg(f"  [OK] 已将{type_str}移到回收站\n")
+            else:
+                self.log_msg(f"  [!] 删除失败（可能仍有占用或权限不足）")
+                self.log_msg(f"  [提示] 可手动删除或稍后重试\n")
+
+        if self._all_stopped_services:
+            self._show_service_restore_dialog(auto_popup=True)
 
 
 if __name__ == "__main__":
