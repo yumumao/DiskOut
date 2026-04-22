@@ -28,7 +28,7 @@ except ImportError:
     HAS_WINDND = False
 
 # ── 版本号（修改此处即可更新界面右上角显示） ──
-APP_VERSION = "3.3.1"    # ★ 修改：版本号更新
+APP_VERSION = "3.3.2"    # ★ 修改：版本号更新
 
 SERVICES = [
     ("WSearch",       "Windows Search"),
@@ -653,8 +653,8 @@ class App:
         self.root = tk.Tk()
         title_mode = "管理员模式" if self._is_admin else "普通模式"
         self.root.title(f"移动硬盘弹出工具 - {title_mode}")
-        self.root.geometry("560x720")
-        self.root.minsize(460, 560)
+        self.root.geometry("560x750")
+        self.root.minsize(460, 550)
         self._set_icon(self.root)
         self._busy = False
         self._all_stopped_services = {}
@@ -1323,20 +1323,20 @@ class App:
         self.log_msg("正在后台识别磁盘总线类型...")
 
         # ★ 修改：拖放启动日志区分管理员模式
-        if HAS_WINDND:
-            if self._dnd_ok:
-                self.log_msg("[拖放] windnd 已加载，支持拖放文件/文件夹到窗口")
-                if self._is_admin:
-                    self.log_msg("[拖放] 管理员模式：已放行 UIPI 拖放消息"
-                                 "（WM_DROPFILES / WM_COPYGLOBALDATA）")
-                    self.log_msg("[拖放] 如拖放仍不可用，"
-                                 "请使用「文件」或「文件夹」浏览按钮")
-            else:
-                self.log_msg("[拖放] windnd 已安装但初始化失败，请使用浏览按钮")
-        else:
-            self.log_msg("[拖放] 未安装 windnd，可用 pip install windnd 启用拖放")
-
-        self.log_msg("")
+#        if HAS_WINDND:
+#            if self._dnd_ok:
+#                self.log_msg("[拖放] windnd 已加载，支持拖放文件/文件夹到窗口")
+#                if self._is_admin:
+#                    self.log_msg("[拖放] 管理员模式：已放行 UIPI 拖放消息"
+#                                 "（WM_DROPFILES / WM_COPYGLOBALDATA）")
+#                    self.log_msg("[拖放] 如拖放仍不可用，"
+#                                 "请使用「文件」或「文件夹」浏览按钮")
+#            else:
+#                self.log_msg("[拖放] windnd 已安装但初始化失败，请使用浏览按钮")
+#        else:
+#            self.log_msg("[拖放] 未安装 windnd，可用 pip install windnd 启用拖放")
+#
+#        self.log_msg("")
 
     # ════════════════════════════════════════════════════════════
     #  Notebook 动态高度
