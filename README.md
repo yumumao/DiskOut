@@ -86,6 +86,62 @@ common "This device is currently in use" ejection failure.
 
 ---
 
+## 日志示例 / Log Example
+
+> **注意 / Note:**
+>
+> 在此场景下，Windows 系统托盘的「安全删除硬件」以及传统的第三方弹出工具均**无法正常弹出**该硬盘。
+> 原因是 Windows Search、Storage Service 等系统服务持有文件句柄，传统工具无法停止这些服务，也就无法解除占用，导致弹出反复失败。
+> 本工具通过「先停服务 → 再弹硬盘 → 后恢复服务」的完整流程，实现真正可靠的安全弹出。
+>
+> In this scenario, both the Windows system tray "Safely Remove Hardware" and traditional third-party eject tools **fail to eject** the drive.
+> This is because system services such as Windows Search and Storage Service hold open file handles. Traditional tools cannot stop these services, thus cannot release the locks, causing repeated eject failures.
+> This tool achieves a truly reliable safe eject through the complete workflow: **Stop services → Eject drive → Restore services**.
+
+---
+
+```
+==================================================
+  安全弹出 I: / Safely Eject I:
+==================================================
+
+步骤 1：停止占用服务...
+Step 1: Stopping services holding file locks...
+
+  停止 Windows Search ...           / Stopping Windows Search ...
+  跳过 SysMain (stopped)            / Skipped SysMain (stopped)
+  跳过 Volume Shadow Copy (stopped) / Skipped Volume Shadow Copy (stopped)
+  跳过 Optimize Drives (stopped)    / Skipped Optimize Drives (stopped)
+  跳过 WMP Network Sharing (missing)/ Skipped WMP Network Sharing (missing)
+  停止 Storage Service ...          / Stopping Storage Service ...
+
+步骤 2：弹出硬盘（逐一尝试多种方法）...
+Step 2: Ejecting drive (trying methods one by one)...
+
+  获取磁盘信息...                   / Retrieving disk info...
+    物理磁盘号: 3                   / Physical Disk Number: 3
+
+  方法1: USB 安全移除 (CM_Request_Device_Eject) ...
+  Method 1: USB Safe Removal (CM_Request_Device_Eject) ...
+    PnP: SCSI\DISK&VEN_SAMSUNG&PROD_PSSD_T7\************
+    Parent: USB\VID_04E8&PID_4001\************
+    USB_EJECT_OK
+    盘符已消失，硬盘已安全移除并停转!
+    Drive letter gone, disk safely removed and spun down!
+
+[OK] I: 已成功弹出！可以安全拔出硬盘。
+[OK] I: Successfully ejected! It is now safe to unplug the drive.
+
+步骤 3：恢复服务...
+Step 3: Restoring services...
+
+  已恢复 Windows Search             / Restored Windows Search
+  已恢复 Storage Service            / Restored Storage Service
+[OK] 服务恢复完成                   / [OK] Service restoration complete
+```
+
+---
+
 1. Double-click `DiskOut.exe` (no admin privileges required to launch)
 2. Select the target drive letter (only G: and later are shown to avoid accidental system drive operations)
 3. Choose the desired operation
