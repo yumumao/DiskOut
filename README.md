@@ -55,7 +55,11 @@ common "This device is currently in use" ejection failure.
 - **Normal mode by default, elevate on demand**: Runs with standard user privileges by default; prompts for admin elevation only when needed, with an option to manually elevate at any time
 
 ---
+## 🖼 界面截图 / Screenshots
 
+![界面截图/Screenshots](./screenshot/screenshot1.png)
+
+---
 ## 📋 系统要求 / Requirements
 
 | 项目 / Item         | 要求 / Requirement             |
