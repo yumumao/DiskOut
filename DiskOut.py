@@ -47,7 +47,8 @@ except ImportError:
 #   全局常量
 # ══════════════════════════════════════════════════════════════
 
-APP_VERSION = "3.9.0"  # ★ v3.9: 中英文界面切换（中文系统默认中文/其它默认英文+切换按钮）
+APP_VERSION = "3.9.1"  # ★ v3.9.1: USB 停转绕开 WMI（SetupAPI+CM_Request_Device_Eject）；恢复功能支持给"在线盘的无盘符数据卷"重新分配盘符
+# v3.9: 中英文界面切换（中文系统默认中文/其它默认英文+切换按钮）
 
 # ── 常见占用移动硬盘的 Windows 服务 ──
 # 这些服务可能会在后台打开 USB 磁盘上的文件/目录，阻止安全弹出
@@ -506,6 +507,137 @@ def get_disk_number_ioctl(letter):
         k32.CloseHandle(ctypes.c_void_p(h))
 
 
+def usb_eject_by_disk_number(disk_number):
+    """
+    不依赖 WMI / PowerShell，按物理磁盘号执行 USB 硬件级安全移除（停转硬盘）。
+
+    流程（全程 ctypes 直调，开机后 WMI/CIM 未就绪时仍可用）：
+      SetupAPI 枚举 GUID_DEVINTERFACE_DISK 下所有磁盘
+      → IOCTL_STORAGE_GET_DEVICE_NUMBER 匹配 DeviceNumber == disk_number
+      → 取该磁盘的 DEVINST → CM_Get_Parent 得到 USB 父节点
+      → CM_Request_Device_Eject 请求弹出整个可移动设备。
+
+    返回 (ok: bool, kind: str, detail: str)：
+      kind ∈ {"ok", "veto", "notfound", "error"}
+        ok       弹出成功，硬盘已收到停转指令
+        veto     系统拒绝弹出（设备被占用），detail 为占用者名称
+        notfound 未匹配到该磁盘号对应的设备
+        error    调用过程异常，detail 为错误信息
+    """
+    if disk_number is None:
+        return (False, "notfound", "disk_number is None")
+    try:
+        setupapi = ctypes.windll.setupapi
+        cfgmgr32 = ctypes.windll.cfgmgr32
+        k32 = ctypes.windll.kernel32
+    except Exception as e:
+        return (False, "error", f"加载 DLL 失败: {e}")
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class _SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("InterfaceClassGuid", _GUID),
+                    ("Flags", wintypes.DWORD),
+                    ("Reserved", ctypes.POINTER(ctypes.c_ulong))]
+
+    class _SP_DEVINFO_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("ClassGuid", _GUID),
+                    ("DevInst", wintypes.DWORD),
+                    ("Reserved", ctypes.POINTER(ctypes.c_ulong))]
+
+    class _SP_DEVICE_INTERFACE_DETAIL_DATA_W(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("DevicePath", ctypes.c_wchar * 512)]
+
+    # GUID_DEVINTERFACE_DISK = {53F56307-B6BF-11D0-94F2-00A0C91EFB8B}
+    disk_guid = _GUID(0x53F56307, 0xB6BF, 0x11D0,
+                      (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0,
+                                           0xC9, 0x1E, 0xFB, 0x8B))
+    DIGCF_PRESENT = 0x02
+    DIGCF_DEVICEINTERFACE = 0x10
+    INVALID = ctypes.c_void_p(-1).value
+    CR_SUCCESS = 0
+
+    # 设置返回类型，避免 64 位句柄被默认的 c_int 截断
+    setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    k32.CreateFileW.restype = ctypes.c_void_p
+
+    hdev = setupapi.SetupDiGetClassDevsW(
+        ctypes.byref(disk_guid), None, None,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+    if not hdev or hdev == INVALID:
+        return (False, "error", "SetupDiGetClassDevs 失败")
+
+    found_devinst = None
+    try:
+        idx = 0
+        while True:
+            did = _SP_DEVICE_INTERFACE_DATA()
+            did.cbSize = ctypes.sizeof(did)
+            if not setupapi.SetupDiEnumDeviceInterfaces(
+                    ctypes.c_void_p(hdev), None, ctypes.byref(disk_guid),
+                    idx, ctypes.byref(did)):
+                break  # 枚举结束（ERROR_NO_MORE_ITEMS）
+            idx += 1
+
+            detail = _SP_DEVICE_INTERFACE_DETAIL_DATA_W()
+            # cbSize 须为结构头大小：64 位=8，32 位=6（经典坑，非整体 sizeof）
+            detail.cbSize = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+            devinfo = _SP_DEVINFO_DATA()
+            devinfo.cbSize = ctypes.sizeof(devinfo)
+            if not setupapi.SetupDiGetDeviceInterfaceDetailW(
+                    ctypes.c_void_p(hdev), ctypes.byref(did),
+                    ctypes.byref(detail), ctypes.sizeof(detail),
+                    None, ctypes.byref(devinfo)):
+                continue
+
+            # 零权限打开磁盘设备，仅用于查询物理磁盘号
+            h = k32.CreateFileW(detail.DevicePath, 0, 0x3, None, 3, 0, None)
+            if h is None or h == INVALID:
+                continue
+            try:
+                sdn = _STORAGE_DEVICE_NUMBER()
+                returned = wintypes.DWORD(0)
+                ok = k32.DeviceIoControl(
+                    ctypes.c_void_p(h), _IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                    None, 0, ctypes.byref(sdn), ctypes.sizeof(sdn),
+                    ctypes.byref(returned), None)
+            finally:
+                k32.CloseHandle(ctypes.c_void_p(h))
+            if ok and sdn.DeviceNumber == disk_number:
+                found_devinst = devinfo.DevInst
+                break
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(ctypes.c_void_p(hdev))
+
+    if found_devinst is None:
+        return (False, "notfound", f"未匹配到物理磁盘号 {disk_number}")
+
+    # 取 USB 父节点，对父设备请求弹出才能停转整盘
+    parent = wintypes.DWORD(0)
+    r = cfgmgr32.CM_Get_Parent(
+        ctypes.byref(parent), wintypes.DWORD(found_devinst), 0)
+    if r != CR_SUCCESS:
+        return (False, "error", f"CM_Get_Parent 失败: CR={r}")
+
+    veto_name = ctypes.create_unicode_buffer(260)
+    veto_type = ctypes.c_int(0)
+    r = cfgmgr32.CM_Request_Device_EjectW(
+        parent, ctypes.byref(veto_type), veto_name, 260, 0)
+    if r == CR_SUCCESS:
+        return (True, "ok", "")
+    vn = veto_name.value.strip()
+    if vn:
+        return (False, "veto", vn)
+    return (False, "veto", f"系统拒绝弹出 (CR={r}, vetoType={veto_type.value})")
+
+
 def get_dos_device(letter):
     """
     使用 QueryDosDeviceW 查询盘符对应的 NT 设备路径。
@@ -637,6 +769,99 @@ def set_disk_online(disk_number):
     )
     rc, _, _ = run_cmd(cmd, timeout=15)
     return rc == 0
+
+
+# ── 无盘符数据卷扫描脚本（恢复功能用） ──
+# 找出"磁盘在线、分区有真实文件系统、却没有盘符"的数据卷，供一键重新分配盘符。
+# 这正是 diskpart `remove all` 弹出后（固定型 USB 盘重插不自动恢复盘符）的遗留状态。
+# 严格排除：脱机磁盘、系统盘 / 0 号盘、隐藏/系统/启动/恢复/保留分区、无文件系统的裸分区。
+RECOVER_SCAN_PS1 = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$rows = @()
+foreach ($d in (Get-Disk | Where-Object { $_.OperationalStatus -ne 'Offline' })) {
+    if ($d.IsSystem) { continue }
+    if ($d.Number -eq 0) { continue }
+    foreach ($p in (Get-Partition -DiskNumber $d.Number)) {
+        if ($p.DriveLetter) { continue }
+        if ($p.IsHidden -or $p.IsSystem -or $p.IsBoot) { continue }
+        if (@('Reserved','System','Recovery') -contains [string]$p.Type) { continue }
+        $v = $p | Get-Volume
+        if (-not $v) { continue }
+        if (-not $v.FileSystemType -or $v.FileSystemType -eq 'Unknown') { continue }
+        $rows += [PSCustomObject]@{
+            Disk   = $d.Number
+            Part   = $p.PartitionNumber
+            SizeGB = [math]::Round($p.Size / 1GB, 1)
+            Fs     = [string]$v.FileSystemType
+            Label  = [string]$v.FileSystemLabel
+            Bus    = [string]$d.BusType
+        }
+    }
+}
+$rows | ConvertTo-Csv -NoTypeInformation
+'''
+
+
+def get_letterless_data_volumes():
+    """
+    扫描"磁盘在线、有真实文件系统、却无盘符"的数据卷（供恢复功能重新分配盘符）。
+    通过临时 PS 脚本调用 Get-Disk/Get-Partition/Get-Volume，已严格过滤系统/隐藏分区。
+    返回 [{'disk','part','size_gb','fs','label','bus'}, ...]，失败或无结果返回 []。
+
+    注：Label 字段排在 Bus 之前——Bus 恒非空，可避免 CSV 末列为空时的解析歧义。
+    """
+    ps_file = os.path.join(os.environ.get("TEMP", "."), "_recover_scan.ps1")
+    out = ""
+    try:
+        with open(ps_file, "w", encoding="utf-8-sig") as f:
+            f.write(RECOVER_SCAN_PS1)
+        _, out, _ = run_cmd(
+            f'powershell -NoProfile -ExecutionPolicy Bypass -File "{ps_file}"',
+            timeout=20)
+    except Exception:
+        return []
+    finally:
+        try:
+            os.remove(ps_file)
+        except OSError:
+            pass
+
+    vols = []
+    if out and out.strip():
+        for line in out.strip().splitlines()[1:]:  # 跳过 CSV 标题行
+            parts = line.strip().strip('"').split('","')
+            if len(parts) >= 6:
+                try:
+                    vols.append({
+                        "disk": int(parts[0]),
+                        "part": int(parts[1]),
+                        "size_gb": float(parts[2]),
+                        "fs": parts[3],
+                        "label": parts[4],
+                        "bus": parts[5],
+                    })
+                except (ValueError, IndexError):
+                    pass
+    return vols
+
+
+def assign_drive_letter(disk_number, part_number, letter):
+    """给指定磁盘/分区分配盘符（需要管理员权限）。letter 形如 'E'。"""
+    cmd = (
+        f'powershell -NoProfile -Command "'
+        f'Set-Partition -DiskNumber {disk_number} '
+        f'-PartitionNumber {part_number} -NewDriveLetter {letter}"')
+    rc, _, _ = run_cmd(cmd, timeout=15)
+    return rc == 0
+
+
+def pick_free_drive_letter(used=None):
+    """从 D..Z 选一个当前空闲（且不在 used 中）的盘符字母，无可用返回 None。"""
+    used = used or set()
+    for c in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        if c not in used and not drive_exists(f"{c}:"):
+            return c
+    return None
 
 
 def eject_volume_api(letter):
@@ -2911,29 +3136,70 @@ class App:
         self.run_in_thread(self._do_recover_offline)
 
     def _do_recover_offline(self):
-        """后台执行脱机磁盘恢复"""
+        """
+        后台执行恢复，两个阶段：
+          ① 脱机磁盘 → 恢复联机（Set-Disk -IsOffline $false）
+          ② 在线磁盘上"有文件系统却无盘符"的数据卷 → 重新分配盘符
+        阶段②正是 diskpart `remove all` 弹出后、固定型 USB 盘重插不自动
+        恢复盘符这一遗留状态的解药（旧版只做①，故扫不到、什么都不做）。
+        """
+        did_something = False
+
+        # ── 阶段①：脱机磁盘恢复联机 ──
         self.log_msg("\n--- 检测脱机磁盘 ---")
         offline = get_offline_disks()
-        if not offline:
-            self.log_msg("  未检测到脱机磁盘，一切正常。\n")
-            return
-        self.log_msg(f"  发现 {len(offline)} 个脱机磁盘：")
-        for d in offline:
-            self.log_msg(
-                f"    磁盘 {d['number']}: {d['name']} "
-                f"({d['size_gb']:.1f} GB, 总线: {d['bus']})")
-        self.log_msg("\n  正在恢复联机...")
-        success = 0
-        for d in offline:
-            self.log_msg(f"    Set-Disk -Number {d['number']} -IsOffline $false ...")
-            ok = set_disk_online(d["number"])
-            if ok:
-                self.log_msg(f"    [OK] 磁盘 {d['number']} 已恢复联机")
-                success += 1
-            else:
-                self.log_msg(f"    [!!] 磁盘 {d['number']} 恢复失败")
-        self.log_msg(f"\n[OK] 共恢复 {success}/{len(offline)} 个磁盘")
-        self.log_msg("正在刷新盘符...\n")
+        if offline:
+            did_something = True
+            self.log_msg(f"  发现 {len(offline)} 个脱机磁盘：")
+            for d in offline:
+                self.log_msg(
+                    f"    磁盘 {d['number']}: {d['name']} "
+                    f"({d['size_gb']:.1f} GB, 总线: {d['bus']})")
+            self.log_msg("\n  正在恢复联机...")
+            success = 0
+            for d in offline:
+                self.log_msg(
+                    f"    Set-Disk -Number {d['number']} -IsOffline $false ...")
+                if set_disk_online(d["number"]):
+                    self.log_msg(f"    [OK] 磁盘 {d['number']} 已恢复联机")
+                    success += 1
+                else:
+                    self.log_msg(f"    [!!] 磁盘 {d['number']} 恢复失败")
+            self.log_msg(f"  共恢复 {success}/{len(offline)} 个脱机磁盘")
+            time.sleep(2)  # 等卷重新挂载后再扫描无盘符卷
+        else:
+            self.log_msg("  未检测到脱机磁盘。")
+
+        # ── 阶段②：无盘符数据卷重新分配盘符 ──
+        self.log_msg("\n--- 检测无盘符的数据卷 ---")
+        vols = get_letterless_data_volumes()
+        if vols:
+            did_something = True
+            self.log_msg(f"  发现 {len(vols)} 个有文件系统但无盘符的卷：")
+            used = set()
+            for v in vols:
+                letter = pick_free_drive_letter(used)
+                label = f" 「{v['label']}」" if v.get("label") else ""
+                head = (f"    磁盘{v['disk']} 分区{v['part']}{label}"
+                        f"（{v['fs']}, {v['size_gb']:.1f} GB, 总线 {v['bus']}）")
+                if not letter:
+                    self.log_msg(f"{head} → [!!] 无可用盘符字母可分配")
+                    continue
+                self.log_msg(f"{head} → 分配 {letter}: ...")
+                if assign_drive_letter(v["disk"], v["part"], letter):
+                    used.add(letter)
+                    self.log_msg(f"    [OK] 已分配盘符 {letter}:")
+                else:
+                    self.log_msg(
+                        f"    [!!] 分配 {letter}: 失败（可在磁盘管理中手动分配）")
+        else:
+            self.log_msg("  未发现无盘符的数据卷。")
+
+        # ── 收尾 ──
+        if did_something:
+            self.log_msg("\n[OK] 恢复流程完成，正在刷新盘符...\n")
+        else:
+            self.log_msg("\n[信息] 没有需要恢复的磁盘或卷，一切正常。\n")
         time.sleep(2)
         self.root.after(0, self.refresh)
 
@@ -2965,10 +3231,50 @@ class App:
 
     def _usb_safe_remove(self, disk_number):
         """
-        通过 CfgMgr32.dll 的 CM_Request_Device_Eject 执行 USB 硬件级安全移除。
-        这会向 USB 控制器发送停止设备命令，使硬盘停止转动。
+        执行 USB 硬件级安全移除（让硬盘停止转动）。
+
+        ★ v3.9.1：优先走纯 ctypes 路径 usb_eject_by_disk_number（不依赖 WMI，
+          开机后 WMI/CIM 未就绪也能停转硬盘）；仅当该路径未达成时，回退旧的
+          PowerShell+WMI 脚本兜底。失败原因记入 self._last_usb_eject_detail
+          =(kind, msg)，供方法1按"被占用 / 环境异常"区分提示。
+          返回 bool（是否成功），与各调用点保持兼容。
+        """
+        # ── 路径一：纯 ctypes（绕开 WMI），用 daemon 线程包超时防卡死 ──
+        done, res = call_with_timeout(
+            usb_eject_by_disk_number, args=(disk_number,),
+            timeout=12, default=(False, "error", "timeout"))
+        if not done:
+            ok, kind, detail = False, "error", "ctypes 路径超时"
+        elif isinstance(res, Exception):
+            ok, kind, detail = False, "error", f"ctypes 异常: {res}"
+        else:
+            ok, kind, detail = res
+
+        if ok:
+            self.log_msg("    [OK] USB 安全移除成功（设备级，硬盘已停转）")
+            self._last_usb_eject_detail = ("ok", "")
+            return True
+        if kind == "veto":
+            # 设备确被占用：PS 路径同样会被否决，不再重试，直接据实上报
+            self.log_msg(f"    [!] 系统拒绝弹出（被占用）: {detail}")
+            self._last_usb_eject_detail = ("veto", detail)
+            return False
+
+        # kind ∈ {notfound, error}：设备级未达成 → 回退 PowerShell+WMI 兜底
+        self.log_msg(
+            f"    [注意] 设备级弹出未达成（{kind}: {detail}），回退 PowerShell...")
+        ok2, kind2, detail2 = self._usb_safe_remove_ps(disk_number)
+        self._last_usb_eject_detail = (kind2, detail2)
+        return ok2
+
+    def _usb_safe_remove_ps(self, disk_number):
+        """
+        旧版 PowerShell + WMI 安全移除（兜底）。返回 (ok, kind, detail)。
+        kind ∈ {"ok","veto","env","error"}：
+          env 表示 WMI/CIM/PS 环境异常（典型为刚开机 WMI 尚未就绪）。
         """
         ps_file = os.path.join(os.environ.get("TEMP", "."), "_usb_eject.ps1")
+        out = err = ""
         try:
             with open(ps_file, "w", encoding="utf-8-sig") as f:
                 f.write(USB_EJECT_PS1)
@@ -2982,15 +3288,34 @@ class App:
             if err.strip():
                 for ln in err.strip().splitlines():
                     self.log_msg(f"    [!] {ln}")
-            return "USB_EJECT_OK" in out
         except Exception as e:
             self.log_msg(f"    [!] 异常: {e}")
-            return False
+            return (False, "error", str(e))
         finally:
             try:
                 os.remove(ps_file)
             except OSError:
                 pass
+
+        text = (out or "") + "\n" + (err or "")
+        if "USB_EJECT_OK" in text:
+            return (True, "ok", "")
+        if "USB_EJECT_FAIL" in text:
+            vn = ""
+            for ln in text.splitlines():
+                if "vetoName=" in ln:
+                    vn = ln.split("vetoName=", 1)[1].strip()
+                    break
+            return (False, "veto", vn or "设备被占用")
+        if ("指定的服务未安装" in text or "无法连接到 CIM" in text
+                or "ERROR:" in text):
+            msg = ""
+            for ln in text.splitlines():
+                if "ERROR:" in ln or "指定的服务未安装" in ln:
+                    msg = ln.strip()
+                    break
+            return (False, "env", msg or "WMI/PS 环境异常")
+        return (False, "error", text.strip()[:120] or "未知失败")
 
     def _flush_volume(self, d):
         """
@@ -3117,7 +3442,18 @@ class App:
                         return True
                     self.log_msg("    弹出指令成功但盘符仍在，继续...")
             else:
-                self.log_msg("    失败（可能有程序占用），尝试下一方法...")
+                kind, detail = getattr(
+                    self, "_last_usb_eject_detail", ("error", ""))
+                if kind == "veto":
+                    self.log_msg(
+                        f"    失败：设备被占用（{detail}），尝试下一方法...")
+                elif kind == "env":
+                    self.log_msg(
+                        "    失败：WMI/PowerShell 环境异常"
+                        "（可能刚开机未就绪，非程序占用），尝试下一方法...")
+                else:
+                    self.log_msg(
+                        f"    失败（{detail or '原因未知'}），尝试下一方法...")
 
         # ── 方法2: DeviceIoControl API（卷级弹出）──
         if is_multi:
