@@ -47,7 +47,7 @@ except ImportError:
 #   全局常量
 # ══════════════════════════════════════════════════════════════
 
-APP_VERSION = "3.9.1"  # ★ v3.9.1: USB 停转绕开 WMI（SetupAPI+CM_Request_Device_Eject）；恢复功能支持给"在线盘的无盘符数据卷"重新分配盘符
+APP_VERSION = "3.9.2"  # ★ v3.9.2: 弹出仅在确认设备级停转后才提示"可安全拔出"，未确认则告警并自动重试停转；v3.9.1: USB 停转绕开 WMI（SetupAPI+CM_Request_Device_Eject）；恢复功能支持给"在线盘的无盘符数据卷"重新分配盘符
 # v3.9: 中英文界面切换（中文系统默认中文/其它默认英文+切换按钮）
 
 # ── 常见占用移动硬盘的 Windows 服务 ──
@@ -1430,6 +1430,7 @@ class App:
         self._eject_disk_number = None     # 当前弹出的磁盘号
         self._eject_all_partitions = []    # 当前弹出涉及的所有分区字母列表
         self._eject_is_multi = False       # 是否为多分区弹出
+        self._eject_spun_down = False      # 上次弹出是否已确认设备级停转（停转成功才置 True）
 
         # ── 文件占用检测状态 ──
         self._file_lock_processes = []     # 检测到的占用进程列表
@@ -3253,6 +3254,7 @@ class App:
         if ok:
             self.log_msg("    [OK] USB 安全移除成功（设备级，硬盘已停转）")
             self._last_usb_eject_detail = ("ok", "")
+            self._eject_spun_down = True   # 确认设备级停转（CM_Request_Device_Eject 成功）
             return True
         if kind == "veto":
             # 设备确被占用：PS 路径同样会被否决，不再重试，直接据实上报
@@ -3357,6 +3359,33 @@ class App:
             self.log_msg(f"    [注意] {letter}: FlushFileBuffers 返回失败，"
                          f"缓冲区可能未完全刷新")
 
+    def _ensure_spindown(self, retries=3, interval=2.0):
+        """逻辑弹出已成功、但尚未确认设备级停转时的补救：带间隔重试停转。
+
+        仅对"非被占用(veto)"失败重试——veto 表示有程序仍持有设备，短时重试
+        无意义且白等；env/error（典型为刚开机 WMI/设备栈未就绪）才值得重试。
+        依赖 self._eject_spun_down：_usb_safe_remove 成功时会将其置 True。
+        """
+        if getattr(self, "_eject_spun_down", False):
+            return  # 已确认停转，无需补救
+        dn = getattr(self, "_eject_disk_number", None)
+        if dn is None:
+            return  # 无物理磁盘号，无法做设备级停转
+        for i in range(retries):
+            kind = getattr(self, "_last_usb_eject_detail", ("", ""))[0]
+            if kind == "veto":
+                self.log_msg(
+                    "    [注意] 设备被占用(veto)，停转重试无意义，跳过自动重试")
+                return
+            self.log_msg(
+                f"    未确认停转，{interval:.0f} 秒后自动重试停转"
+                f"（第 {i + 1}/{retries} 次）...")
+            time.sleep(interval)
+            if self._usb_safe_remove(dn):  # 成功会把 _eject_spun_down 置 True
+                self.log_msg("    [OK] 自动重试停转成功，硬盘已停转")
+                return
+        self.log_msg("    [注意] 自动重试后仍未能确认停转，请勿带电拔盘")
+
     # ════════════════════════════════════════════════════════════
     #  弹出逻辑（五种方法逐一尝试）
     # ════════════════════════════════════════════════════════════
@@ -3398,6 +3427,10 @@ class App:
         self._eject_disk_number = disk_number
         self._eject_all_partitions = list(all_partitions)
         self._eject_is_multi = is_multi
+        # 本次弹出是否已确认设备级停转；仅当某次 _usb_safe_remove 成功时翻为 True。
+        # 方法2/3/4/5 的"逻辑卸载"只移除盘符、并不停转，故默认 False，
+        # 由后续补刀的 _usb_safe_remove 成功与否据实更新（覆盖全部停转成功路径）。
+        self._eject_spun_down = False
 
         # 辅助函数：检查所有分区盘符是否已消失
         def all_gone():
@@ -3857,15 +3890,35 @@ class App:
         self.log_msg("\n步骤 2：弹出硬盘（逐一尝试多种方法）...")
         ok = self._try_eject(d)
         if ok:
+            # 逻辑弹出成功但尚未确认停转时，先自动重试停转，再据实决定提示口径
+            self._ensure_spindown()
+            spun = getattr(self, "_eject_spun_down", False)
             if self._eject_is_multi:
                 parts_str = ", ".join(
                     f"{p}:" for p in self._eject_all_partitions)
                 self.log_msg(
                     f"\n[OK] 磁盘 {self._eject_disk_number}"
                     f"（{parts_str}）已成功弹出！")
-                self.log_msg("     所有分区已安全移除，可以拔出硬盘。")
+                if spun:
+                    self.log_msg("     所有分区已安全移除，可以拔出硬盘。")
+                else:
+                    self.log_msg(
+                        "     所有分区盘符已移除、数据已安全，但未能确认硬盘已停转。")
+                    self.log_msg(
+                        "     [!] 请等待约 5 秒、确认硬盘指示灯熄灭或不再转动后再拔线，")
+                    self.log_msg(
+                        "         以免对仍在转动的硬盘断电造成磁头损伤。")
             else:
-                self.log_msg(f"\n[OK] {d} 已成功弹出！可以安全拔出硬盘。")
+                if spun:
+                    self.log_msg(f"\n[OK] {d} 已成功弹出！可以安全拔出硬盘。")
+                else:
+                    self.log_msg(
+                        f"\n[OK] {d} 已弹出（盘符已移除、数据已安全），"
+                        "但未能确认硬盘已停转。")
+                    self.log_msg(
+                        "     [!] 请等待约 5 秒、确认硬盘指示灯熄灭或不再转动后再拔线，")
+                    self.log_msg(
+                        "         以免对仍在转动的硬盘断电造成磁头损伤。")
         else:
             if self._eject_is_multi:
                 remaining = [
@@ -3939,15 +3992,35 @@ class App:
             self.log_msg("  [注意] 当前为普通模式，方法4/5（需管理员）将被跳过")
         ok = self._try_eject(d)
         if ok:
+            # 逻辑弹出成功但尚未确认停转时，先自动重试停转，再据实决定提示口径
+            self._ensure_spindown()
+            spun = getattr(self, "_eject_spun_down", False)
             if self._eject_is_multi:
                 parts_str = ", ".join(
                     f"{p}:" for p in self._eject_all_partitions)
                 self.log_msg(
                     f"\n[OK] 磁盘 {self._eject_disk_number}"
                     f"（{parts_str}）已弹出！")
-                self.log_msg("     所有分区已安全移除，可以拔出硬盘。\n")
+                if spun:
+                    self.log_msg("     所有分区已安全移除，可以拔出硬盘。\n")
+                else:
+                    self.log_msg(
+                        "     所有分区盘符已移除、数据已安全，但未能确认硬盘已停转。")
+                    self.log_msg(
+                        "     [!] 请等待约 5 秒、确认硬盘指示灯熄灭或不再转动后再拔线，")
+                    self.log_msg(
+                        "         以免对仍在转动的硬盘断电造成磁头损伤。\n")
             else:
-                self.log_msg(f"\n[OK] {d} 已弹出！可以安全拔出硬盘。\n")
+                if spun:
+                    self.log_msg(f"\n[OK] {d} 已弹出！可以安全拔出硬盘。\n")
+                else:
+                    self.log_msg(
+                        f"\n[OK] {d} 已弹出（盘符已移除、数据已安全），"
+                        "但未能确认硬盘已停转。")
+                    self.log_msg(
+                        "     [!] 请等待约 5 秒、确认硬盘指示灯熄灭或不再转动后再拔线，")
+                    self.log_msg(
+                        "         以免对仍在转动的硬盘断电造成磁头损伤。\n")
             self.log_msg("正在刷新盘符列表...")
             time.sleep(1)
             self.root.after(0, self.refresh)
