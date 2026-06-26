@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 移动硬盘安全清理工具 v3.7
 ────────────────────────────────────────────────
@@ -47,7 +47,7 @@ except ImportError:
 #   全局常量
 # ══════════════════════════════════════════════════════════════
 
-APP_VERSION = "3.9.2"  # ★ v3.9.2: 弹出仅在确认设备级停转后才提示"可安全拔出"，未确认则告警并自动重试停转；v3.9.1: USB 停转绕开 WMI（SetupAPI+CM_Request_Device_Eject）；恢复功能支持给"在线盘的无盘符数据卷"重新分配盘符
+APP_VERSION = "3.9.3"  # ★ v3.9.3: 弹出成功判定加入强挂载校验，避免 GetLogicalDrives 残留盘符位导致"实际已卸载/弹出却报失败"；v3.9.2: 弹出仅在确认设备级停转后才提示"可安全拔出"，未确认则告警并自动重试停转；v3.9.1: USB 停转绕开 WMI（SetupAPI+CM_Request_Device_Eject）；恢复功能支持给"在线盘的无盘符数据卷"重新分配盘符
 # v3.9: 中英文界面切换（中文系统默认中文/其它默认英文+切换按钮）
 
 # ── 常见占用移动硬盘的 Windows 服务 ──
@@ -310,6 +310,46 @@ def drive_exists(letter):
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
     return bool(bitmask & (1 << idx))
 
+
+
+def drive_mounted_strong(letter, expected_disk_number=None):
+    """强校验盘符是否仍有真实分区挂载。
+
+    GetLogicalDrives 在 USB 卷刚卸载/弹出时可能短暂保留盘符位，导致
+    程序把已经消失的卷误判为仍存在。弹出流程用本函数二次确认：
+    先查快速位图，再用短超时 IOCTL / Get-Partition 验证盘符背后是否
+    仍能对应到真实分区。无法确认时保守视为仍挂载。
+    """
+    letter = letter.rstrip(":\\").upper()
+    if not drive_exists(f"{letter}:"):
+        return False
+
+    done, dn = call_with_timeout(
+        get_disk_number_ioctl, args=(letter,), timeout=1.5, default=None)
+    if done and isinstance(dn, int):
+        return expected_disk_number is None or dn == expected_disk_number
+
+    cmd = (
+        'powershell -NoProfile -Command "'
+        f"try {{ $p = Get-Partition -DriveLetter {letter} -ErrorAction Stop; "
+        "Write-Output ('FOUND:{0}' -f $p.DiskNumber) } "
+        "catch { Write-Output 'NOTFOUND' }"
+        '"')
+    rc, out, err = run_cmd(cmd, timeout=3)
+    text = ((out or "") + "\n" + (err or "")).strip()
+    if "NOTFOUND" in text:
+        return False
+    if "FOUND:" in text:
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("FOUND:"):
+                try:
+                    dn = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    return True
+                return expected_disk_number is None or dn == expected_disk_number
+
+    return True
 
 def get_drive_type_code(letter):
     """
@@ -3432,20 +3472,30 @@ class App:
         # 由后续补刀的 _usb_safe_remove 成功与否据实更新（覆盖全部停转成功路径）。
         self._eject_spun_down = False
 
+        stale_letter_logged = set()
+
+        def is_still_mounted(p):
+            mounted = drive_mounted_strong(f"{p}:", disk_number)
+            if (not mounted) and drive_exists(f"{p}:") and p not in stale_letter_logged:
+                stale_letter_logged.add(p)
+                self.log_msg(
+                    f"    [信息] {p}: 盘符位仍有残留，但 Get-Partition/IOCTL 已确认无真实挂载")
+            return mounted
+
         # 辅助函数：检查所有分区盘符是否已消失
         def all_gone():
             for p in all_partitions:
-                if drive_exists(f"{p}:"):
+                if is_still_mounted(p):
                     return False
             return True
 
         # 辅助函数：获取仍在挂载的分区列表
         def get_remaining():
-            return [f"{p}:" for p in all_partitions if drive_exists(f"{p}:")]
+            return [f"{p}:" for p in all_partitions if is_still_mounted(p)]
 
         # 辅助函数：检查目标盘符是否已消失
         def target_gone():
-            return not drive_exists(d)
+            return not is_still_mounted(letter)
 
         # 多分区时先刷新所有分区的写缓冲区
         if is_multi:
