@@ -2,9 +2,9 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 echo.
-echo  ╔══════════════════════════════════════╗
-echo  ║     DiskOut 安全弹盘工具 - 打包      ║
-echo  ╚══════════════════════════════════════╝
+echo  +--------------------------------------+
+echo  ^|     DiskOut 安全弹盘工具 - 打包      ^|
+echo  +--------------------------------------+
 echo.
 
 REM ── 检测 Python ──
@@ -155,6 +155,13 @@ echo [4/5] 正在打包 (干净环境 + 排除冗余模块) ...
 echo       这可能需要 1~3 分钟 ...
 echo.
 
+tasklist /fi "imagename eq DiskOut.exe" | find /i "DiskOut.exe" >nul
+if not errorlevel 1 (
+    echo [错误] 检测到 DiskOut.exe 正在运行，请先退出 DiskOut 后再打包
+    pause
+    exit /b 1
+)
+
 %VENV_PYTHON% -m PyInstaller ^
     --onefile ^
     --windowed ^
@@ -174,7 +181,6 @@ echo.
     --exclude-module lib2to3 ^
     --exclude-module xmlrpc ^
     --exclude-module multiprocessing ^
-    --strip ^
     --clean ^
     diskout.py
 
@@ -192,10 +198,10 @@ echo.
 for %%A in (dist\DiskOut.exe) do (
     set "SIZE=%%~zA"
     set /a "SIZE_MB=!SIZE! / 1048576"
-    echo  ╔══════════════════════════════════════╗
-    echo  ║  输出: dist\DiskOut.exe              ║
-    echo  ║  大小: !SIZE_MB! MB                          ║
-    echo  ╚══════════════════════════════════════╝
+    echo  +--------------------------------------+
+    echo  ^|  输出: dist\DiskOut.exe              ^|
+    echo  ^|  大小: !SIZE_MB! MB                          ^|
+    echo  +--------------------------------------+
 )
 echo.
 
